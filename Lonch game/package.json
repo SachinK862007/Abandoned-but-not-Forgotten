@@ -1,0 +1,11 @@
+{
+  "name": "launch-lab",
+  "version": "1.0.0",
+  "description": "Build a rocket, pick a launch site, launch it in 3D.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node serve.mjs",
+    "test": "node --test test/sim.test.mjs"
+  }
+}
