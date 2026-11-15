@@ -4,6 +4,7 @@ import { AlertTriangle, ArrowUpRight, Loader2, MapPin, RefreshCw, Search } from 
 import Link from 'next/link'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { ApiError, api, errorMessage } from '@/lib/api-client'
+import MissionFilm from './mission-film'
 import {
   CATEGORIES,
   PLANET_LABELS,
@@ -44,6 +45,7 @@ export default function RelicArchive() {
   const [query, setQuery] = useState('')
   const [mode, setMode] = useState<ExplorerMode>('junior')
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [filmToken, setFilmToken] = useState(0)
   const [reloadToken, setReloadToken] = useState(0)
   const [relics, setRelics] = useState<RelicState>({ status: 'loading', items: [] })
   const [log, setLog] = useState<LogState>({ status: 'loading', items: [] })
@@ -94,6 +96,18 @@ export default function RelicArchive() {
         setHealth('offline')
       })
     return () => controller.abort()
+  }, [])
+
+  // Selecting a record starts its mission film; clicking again replays it.
+  const startFilm = useCallback((id: string) => {
+    setSelectedId(id)
+    setFilmToken((value) => value + 1)
+    // Stacked layout: the player lives in the detail panel below the list.
+    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 1023px)').matches) {
+      window.setTimeout(() => {
+        document.getElementById('relic-detail')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }, 60)
+    }
   }, [])
 
   const visible = useMemo(() => {
@@ -279,7 +293,7 @@ export default function RelicArchive() {
               {visible.map((relic) => {
                 const active = selected?.id === relic.id
                 return (
-                  <li key={relic.id}>
+                  <li key={relic.id} className="relative">
                     <button
                       type="button"
                       onClick={() => setSelectedId(relic.id)}
@@ -306,6 +320,14 @@ export default function RelicArchive() {
                         {fmtCoord(relic.latitude, 'N', 'S')} · {fmtCoord(relic.longitude, 'E', 'W')}
                       </span>
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => startFilm(relic.id)}
+                      aria-label={`Play the 3D mission film for ${relic.name}`}
+                      className="absolute bottom-3 right-3 rounded-full border border-orbit/40 bg-void/70 px-2.5 py-1 font-display text-[9px] uppercase tracking-[0.16em] text-moon transition-colors hover:border-electric/70 hover:text-starlight"
+                    >
+                      Film
+                    </button>
                   </li>
                 )
               })}
@@ -314,7 +336,7 @@ export default function RelicArchive() {
         </div>
 
         {/* ---------- detail ---------- */}
-        <aside className="lg:sticky lg:top-24 lg:self-start">
+        <aside id="relic-detail" className="scroll-mt-24 lg:sticky lg:top-24 lg:self-start">
           {selected ? (
             <div className="glass rounded-3xl p-6">
               <div className="flex items-start justify-between gap-3">
@@ -330,6 +352,8 @@ export default function RelicArchive() {
                   {selected.year}
                 </span>
               </div>
+
+              <MissionFilm relic={selected} autoPlayToken={filmToken} />
 
               <div role="group" aria-label="Explorer mode" className="mt-5 flex rounded-full bg-white/[0.04] p-1">
                 {(['junior', 'analyst'] as const).map((option) => (

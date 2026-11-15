@@ -26,15 +26,13 @@ export default function PageTransition({ children }: { children: React.ReactNode
 
   if (pathname === '/') return <>{children}</>
 
-  // The game gets a slightly longer, more cinematic entrance.
-  const isGame = pathname === '/game'
-
+  // One timing for every tab: the same fade-and-rise the Moon route uses.
   return (
     <motion.div
       key={pathname}
       initial={{ opacity: 0, y: reduced ? 0 : 6 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: reduced ? 0 : isGame ? 0.3 : 0.24, ease: [0.22, 1, 0.36, 1] }}
+      transition={{ duration: reduced ? 0 : 0.24, ease: [0.22, 1, 0.36, 1] }}
       className="relative z-10"
     >
       {children}
