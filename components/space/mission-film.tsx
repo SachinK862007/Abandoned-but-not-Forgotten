@@ -1,23 +1,25 @@
 'use client'
 
 import type * as ThreeTypes from 'three'
-import { Pause, Play, RotateCcw } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Captions, Maximize2, Minimize2, Pause, Play, RotateCcw, Volume2, VolumeX, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type { Relic } from '@/lib/types'
 
 /**
  * Mission film: a short 3D cinematic generated in the browser from the relic's
  * own dataset values — the target body, the published landing coordinates, the
- * agency and the year. Nothing is fetched, nothing navigates away and no fact is
- * invented; the film is a visualisation of the record you are reading.
+ * agency, the year and the recorded hardware class.
  *
- * Everything happens inside this card: poster → play → live three.js render.
+ * Nothing is fetched, nothing navigates away, and no mission fact is invented:
+ * the film visualises the record you are reading, narrates it out loud, and can
+ * be expanded to fill the window without losing playback.
  */
 
-const DURATION = 9.4
-const T_INBOUND = 1.1
-const T_IMPACT = 3.7
-const T_REVEAL = 4.7
+const DURATION = 11
+const T_INBOUND = 1.4
+const T_IMPACT = 4.2
+const T_REVEAL = 5.4
 
 const BODY_TEXTURE: Record<Relic['planet'], string> = {
   moon: '/space/textures/moon.jpg',
@@ -35,6 +37,26 @@ const BODY_LABEL: Record<Relic['planet'], string> = {
 }
 
 const PHASE_LABEL = ['Approach', 'Terminal descent', 'Touchdown', 'Site locked'] as const
+
+type VehicleKind = 'rover' | 'crewed' | 'sample' | 'satellite' | 'lander'
+
+const VEHICLE_NAME: Record<VehicleKind, string> = {
+  rover: 'rover',
+  crewed: 'crewed capsule',
+  sample: 'sample-return capsule',
+  satellite: 'satellite bus',
+  lander: 'lander',
+}
+
+/** Pick the hardware model that matches the record's own class. */
+function vehicleFor(relic: Relic): VehicleKind {
+  const kind = relic.kind.toLowerCase()
+  if (relic.category === 'rover' || /rover/.test(kind)) return 'rover'
+  if (relic.category === 'sample-return' || /sample/.test(kind)) return 'sample'
+  if (relic.category === 'crewed' || /crewed/.test(kind)) return 'crewed'
+  if (/orbiter|satellite|flyby|probe|impactor/.test(kind)) return 'satellite'
+  return 'lander'
+}
 
 function easeInOut(x: number) {
   return x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2
@@ -67,15 +89,50 @@ export default function MissionFilm({
   const [progress, setProgress] = useState(0)
   const [phase, setPhase] = useState(0)
   const [failed, setFailed] = useState(false)
+  const [expanded, setExpanded] = useState(false)
+  const [voice, setVoice] = useState(true)
+  const [captions, setCaptions] = useState(true)
+  const [mounted, setMounted] = useState(false)
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const stageRef = useRef<HTMLDivElement | null>(null)
   const playingRef = useRef(false)
   const elapsedRef = useRef(0)
 
+  const vehicle = useMemo(() => vehicleFor(relic), [relic])
+  const vehicleName = VEHICLE_NAME[vehicle]
+  const latText = fmtCoord(relic.latitude, 'N', 'S')
+  const lonText = fmtCoord(relic.longitude, 'E', 'W')
+
+  /** Spoken + written explanation for each beat of the film. */
+  const narration = useMemo(
+    () => [
+      `${relic.name}. ${relic.agency}, ${relic.year}. Approaching ${BODY_LABEL[relic.planet]}.`,
+      `A ${vehicleName} descends toward the published landing coordinates: ${latText}, ${lonText}.`,
+      `Touchdown. The record lists this as: ${relic.kind}.`,
+      `Site locked. Marker placed from the NASA dataset coordinates. That is the ${relic.name} story.`,
+    ],
+    [relic.name, relic.agency, relic.year, relic.planet, relic.kind, vehicleName, latText, lonText],
+  )
+
+  /** Plain-language note describing what is on screen right now. */
+  const sceneNote = useMemo(
+    () => [
+      `A textured globe of ${BODY_LABEL[relic.planet]} with the descent track beginning out in space.`,
+      `The ${vehicleName} rides the track down to ${latText}, ${lonText}.`,
+      `A ring marks the touchdown point named in the dataset.`,
+      `The site marker stays fixed on the surface at the documented coordinates.`,
+    ],
+    [relic.planet, vehicleName, latText, lonText],
+  )
+
   useEffect(() => {
     playingRef.current = playing
   }, [playing])
+
+  // Portals need a client; keeps the expanded player out of the page's stacking
+  // context so the navbar cannot paint over it.
+  useEffect(() => setMounted(true), [])
 
   // A different mission selected: back to the poster.
   useEffect(() => {
@@ -86,12 +143,49 @@ export default function MissionFilm({
     elapsedRef.current = 0
   }, [relic.id])
 
-  // "Film" clicked on a list row: start this mission's film immediately.
   useEffect(() => {
     if (autoPlayToken === 0) return
     setActive(true)
     setPlaying(true)
   }, [autoPlayToken])
+
+  // Narration follows the film, and stops the moment it pauses or closes.
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return
+    const synth = window.speechSynthesis
+    if (!active || !voice || !playing) {
+      synth.cancel()
+      return
+    }
+    synth.cancel()
+    const utterance = new SpeechSynthesisUtterance(narration[phase])
+    utterance.rate = 0.94
+    utterance.pitch = 1
+    utterance.volume = 1
+    synth.speak(utterance)
+    return () => synth.cancel()
+  }, [phase, playing, voice, active, narration])
+
+  useEffect(() => {
+    return () => {
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) window.speechSynthesis.cancel()
+    }
+  }, [])
+
+  // Expanded player: Esc closes, page scroll is parked.
+  useEffect(() => {
+    if (!expanded) return
+    const previous = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setExpanded(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      document.body.style.overflow = previous
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [expanded])
 
   useEffect(() => {
     if (!active) return
@@ -172,9 +266,6 @@ export default function MissionFilm({
       // ---- landing site -----------------------------------------------------
       const site = surfacePoint(relic.latitude, relic.longitude, 1.004)
       const markerPos = new THREE.Vector3(site.x, site.y, site.z)
-
-      // Turn the body so the documented site faces the camera, and only sway
-      // from there so the site never rotates out of view.
       const baseYaw = -Math.atan2(markerPos.x, markerPos.z)
       world.rotation.y = baseYaw
 
@@ -206,11 +297,66 @@ export default function MissionFilm({
       const trailMat = new THREE.LineBasicMaterial({ color: 0x9fc4ff, transparent: true, opacity: 0 })
       world.add(new THREE.Line(trailGeo, trailMat))
 
-      const probeGeo = new THREE.SphereGeometry(0.026, 16, 16)
-      const probeMat = new THREE.MeshBasicMaterial({ color: 0xf4f9ff })
-      const probe = new THREE.Mesh(probeGeo, probeMat)
-      probe.visible = false
-      world.add(probe)
+      // ---- vehicle: the hardware class recorded for this mission ------------
+      const vehicleGroup = new THREE.Group()
+      const metalMat = new THREE.MeshStandardMaterial({ color: 0xdde5f3, roughness: 0.34, metalness: 0.65 })
+      const goldMat = new THREE.MeshStandardMaterial({ color: 0xd8a444, roughness: 0.42, metalness: 0.8 })
+      const panelMat = new THREE.MeshStandardMaterial({ color: 0x35558f, roughness: 0.25, metalness: 0.5 })
+      const darkMat = new THREE.MeshStandardMaterial({ color: 0x2b3450, roughness: 0.7, metalness: 0.2 })
+      const parts: ThreeTypes.BufferGeometry[] = []
+
+      const add = (geometry: ThreeTypes.BufferGeometry, material: ThreeTypes.Material, x = 0, y = 0, z = 0) => {
+        parts.push(geometry)
+        const mesh = new THREE.Mesh(geometry, material)
+        mesh.position.set(x, y, z)
+        vehicleGroup.add(mesh)
+        return mesh
+      }
+
+      if (vehicle === 'rover') {
+        add(new THREE.BoxGeometry(0.1, 0.038, 0.062), goldMat)
+        add(new THREE.BoxGeometry(0.07, 0.006, 0.05), panelMat, 0, 0.03, 0)
+        add(new THREE.CylinderGeometry(0.005, 0.005, 0.06, 8), metalMat, 0, 0.05, -0.012)
+        add(new THREE.BoxGeometry(0.016, 0.012, 0.012), darkMat, 0, 0.082, -0.012)
+        for (const x of [-0.034, 0, 0.034]) {
+          for (const z of [-0.036, 0.036]) {
+            const wheel = add(new THREE.CylinderGeometry(0.018, 0.018, 0.012, 16), darkMat, x, -0.03, z)
+            wheel.rotation.z = Math.PI / 2
+          }
+        }
+      } else if (vehicle === 'crewed') {
+        add(new THREE.ConeGeometry(0.052, 0.075, 24), metalMat, 0, 0.02, 0)
+        add(new THREE.CylinderGeometry(0.05, 0.052, 0.03, 24), goldMat, 0, -0.035, 0)
+        add(new THREE.CylinderGeometry(0.012, 0.012, 0.02, 12), metalMat, 0, 0.065, 0)
+      } else if (vehicle === 'sample') {
+        add(new THREE.ConeGeometry(0.045, 0.045, 20), metalMat, 0, 0.01, 0)
+        add(new THREE.SphereGeometry(0.032, 20, 14), goldMat, 0, -0.026, 0)
+        add(new THREE.CylinderGeometry(0.004, 0.004, 0.03, 8), metalMat, 0, 0.045, 0)
+      } else if (vehicle === 'satellite') {
+        add(new THREE.BoxGeometry(0.05, 0.05, 0.05), metalMat)
+        add(new THREE.BoxGeometry(0.085, 0.004, 0.05), panelMat, -0.075, 0, 0)
+        add(new THREE.BoxGeometry(0.085, 0.004, 0.05), panelMat, 0.075, 0, 0)
+        add(new THREE.CylinderGeometry(0.015, 0.02, 0.012, 16), goldMat, 0, 0.036, 0)
+      } else {
+        add(new THREE.CylinderGeometry(0.045, 0.045, 0.05, 20), metalMat)
+        add(new THREE.CylinderGeometry(0.03, 0.045, 0.018, 20), goldMat, 0, -0.034, 0)
+        add(new THREE.CylinderGeometry(0.003, 0.003, 0.05, 8), metalMat, 0, 0.045, 0)
+        for (let i = 0; i < 4; i += 1) {
+          const angle = (i / 4) * Math.PI * 2 + Math.PI / 4
+          const legGeo = new THREE.CylinderGeometry(0.004, 0.004, 0.06, 6)
+          parts.push(legGeo)
+          const leg = new THREE.Mesh(legGeo, metalMat)
+          leg.position.set(Math.cos(angle) * 0.032, -0.03, Math.sin(angle) * 0.032)
+          leg.rotation.z = Math.cos(angle) * 0.5
+          leg.rotation.x = Math.sin(angle) * 0.5
+          vehicleGroup.add(leg)
+        }
+      }
+
+      const vehiclePivot = new THREE.Group()
+      vehiclePivot.add(vehicleGroup)
+      vehiclePivot.visible = false
+      world.add(vehiclePivot)
 
       // ---- framing ----------------------------------------------------------
       const orbit = { theta: 0, phi: 0.14, radius: 4.6 }
@@ -284,15 +430,21 @@ export default function MissionFilm({
 
         const targetRadius = t < T_INBOUND ? 4.6 - 1.05 * (t / T_INBOUND) : t < T_IMPACT ? 3.55 : 2.95
         orbit.radius += (targetRadius - orbit.radius) * Math.min(1, dt * 2.4)
-        orbit.theta += 0.0006 * (dragging ? 0 : 1)
         place()
 
         world.rotation.y = baseYaw + Math.sin(t * 0.16) * 0.12
 
         const inbound = Math.max(0, Math.min(1, (t - T_INBOUND) / (T_IMPACT - T_INBOUND)))
         trailMat.opacity = inbound > 0 ? 0.45 * (1 - inbound * 0.3) : 0
-        probe.visible = inbound > 0 && inbound < 1
-        if (probe.visible) probe.position.copy(curve.getPoint(easeInOut(inbound)))
+        vehiclePivot.visible = inbound > 0 && inbound < 1
+        if (vehiclePivot.visible) {
+          const e = easeInOut(inbound)
+          const point = curve.getPoint(e)
+          const tangent = curve.getTangent(e).normalize()
+          vehiclePivot.position.copy(point)
+          vehiclePivot.lookAt(point.clone().add(tangent))
+          vehicleGroup.rotation.y = t * 0.6
+        }
 
         const sinceImpact = t - T_IMPACT
         if (sinceImpact > 0) {
@@ -337,8 +489,11 @@ export default function MissionFilm({
         ringMat.dispose()
         trailGeo.dispose()
         trailMat.dispose()
-        probeGeo.dispose()
-        probeMat.dispose()
+        for (const geometry of parts) geometry.dispose()
+        metalMat.dispose()
+        goldMat.dispose()
+        panelMat.dispose()
+        darkMat.dispose()
         renderer.dispose()
       }
     }
@@ -352,7 +507,7 @@ export default function MissionFilm({
       cancelAnimationFrame(raf)
       teardown?.()
     }
-  }, [active, relic.id, relic.planet, relic.latitude, relic.longitude])
+  }, [active, relic.id, relic.planet, relic.latitude, relic.longitude, vehicle, expanded])
 
   const toggle = useCallback(() => {
     if (!active) {
@@ -370,25 +525,75 @@ export default function MissionFilm({
     setPlaying(true)
   }, [])
 
-  const caption =
-    phase === 0
-      ? `${relic.agency} · ${relic.year}`
-      : phase === 1
-        ? `Descent · ${fmtCoord(relic.latitude, 'N', 'S')} ${fmtCoord(relic.longitude, 'E', 'W')}`
-        : phase === 2
-          ? 'Touchdown'
-          : `${relic.kind} · site locked`
+  const card = (
+    <div
+      className={
+        expanded
+          ? 'fixed inset-0 z-[100] flex flex-col gap-2 bg-[#04050c]/96 p-3 backdrop-blur-md sm:p-6'
+          : 'mt-5 overflow-hidden rounded-2xl border border-orbit/25 bg-void/60'
+      }
+    >
+      <div className="flex items-center justify-between gap-2 px-1 sm:px-0">
+        <div className="flex items-center gap-2">
+          <p className="font-display text-[9px] uppercase tracking-[0.24em] text-electric">Mission film</p>
+          {expanded && (
+            <span className="font-display text-[9px] uppercase tracking-[0.18em] text-moon/60">{relic.name}</span>
+          )}
+        </div>
 
-  return (
-    <div className="mt-5 overflow-hidden rounded-2xl border border-orbit/25 bg-void/60">
-      <div className="flex items-center justify-between gap-2 px-3 pt-3">
-        <p className="font-display text-[9px] uppercase tracking-[0.24em] text-electric">Mission film</p>
-        <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-moon/45">
-          {BODY_LABEL[relic.planet]} · generated
-        </p>
+        <div className="flex items-center gap-1.5">
+          <p className="mr-1 font-mono text-[9px] uppercase tracking-[0.16em] text-moon/45">
+            {BODY_LABEL[relic.planet]} · {vehicleName}
+          </p>
+          <button
+            type="button"
+            onClick={() => setCaptions((value) => !value)}
+            aria-pressed={captions}
+            aria-label={captions ? 'Hide subtitles' : 'Show subtitles'}
+            className={`flex size-6 items-center justify-center rounded-full border transition-colors ${
+              captions ? 'border-electric/60 text-starlight' : 'border-orbit/30 text-moon/60 hover:text-starlight'
+            }`}
+          >
+            <Captions className="size-3" aria-hidden />
+          </button>
+          <button
+            type="button"
+            onClick={() => setVoice((value) => !value)}
+            aria-pressed={voice}
+            aria-label={voice ? 'Mute narration' : 'Unmute narration'}
+            className={`flex size-6 items-center justify-center rounded-full border transition-colors ${
+              voice ? 'border-electric/60 text-starlight' : 'border-orbit/30 text-moon/60 hover:text-starlight'
+            }`}
+          >
+            {voice ? <Volume2 className="size-3" aria-hidden /> : <VolumeX className="size-3" aria-hidden />}
+          </button>
+          <button
+            type="button"
+            onClick={() => setExpanded((value) => !value)}
+            aria-label={expanded ? 'Collapse film' : 'Expand film'}
+            className="flex size-6 items-center justify-center rounded-full border border-orbit/30 text-moon transition-colors hover:border-electric/60 hover:text-starlight"
+          >
+            {expanded ? <Minimize2 className="size-3" aria-hidden /> : <Maximize2 className="size-3" aria-hidden />}
+          </button>
+          {expanded && (
+            <button
+              type="button"
+              onClick={() => setExpanded(false)}
+              aria-label="Close film"
+              className="flex size-6 items-center justify-center rounded-full border border-orbit/30 text-moon transition-colors hover:border-electric/60 hover:text-starlight"
+            >
+              <X className="size-3" aria-hidden />
+            </button>
+          )}
+        </div>
       </div>
 
-      <div ref={stageRef} className="relative mt-2 aspect-[16/9] w-full overflow-hidden bg-[#05060f]">
+      <div
+        ref={stageRef}
+        className={`relative w-full overflow-hidden bg-[#05060f] ${
+          expanded ? 'min-h-0 flex-1 rounded-xl' : 'mt-2 aspect-[16/9]'
+        }`}
+      >
         {active ? (
           <canvas ref={canvasRef} className="size-full cursor-grab touch-none active:cursor-grabbing" />
         ) : (
@@ -404,17 +609,19 @@ export default function MissionFilm({
               <Play className="size-3.5" aria-hidden />
               Play film
             </button>
-            <p className="font-mono text-[9px] uppercase tracking-[0.14em] text-moon/40">≈ 9 s · plays here</p>
+            <p className="font-mono text-[9px] uppercase tracking-[0.14em] text-moon/40">
+              ≈ {DURATION} s · narrated · plays here
+            </p>
           </div>
         )}
 
         {active && !failed && (
-          <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-3 bg-gradient-to-b from-void/80 to-transparent p-2.5">
+          <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-3 bg-gradient-to-b from-void/85 to-transparent p-2.5">
             <span className="font-display text-[9px] uppercase tracking-[0.2em] text-starlight/90">
               {PHASE_LABEL[phase]}
             </span>
             <span className="max-w-[62%] text-right font-mono text-[9px] leading-relaxed text-moon/75">
-              {caption}
+              {relic.agency} · {relic.year} · {relic.kind}
             </span>
           </div>
         )}
@@ -427,8 +634,14 @@ export default function MissionFilm({
           </div>
         )}
 
+        {active && !failed && captions && (
+          <p className="pointer-events-none absolute inset-x-0 bottom-12 mx-auto max-w-[92%] rounded-lg bg-void/70 px-3 py-1.5 text-center text-[11px] leading-snug text-starlight/90">
+            {narration[phase]}
+          </p>
+        )}
+
         {active && !failed && (
-          <div className="absolute inset-x-0 bottom-0 flex items-center gap-2 bg-gradient-to-t from-void/85 to-transparent p-2.5">
+          <div className="absolute inset-x-0 bottom-0 flex items-center gap-2 bg-gradient-to-t from-void/90 to-transparent p-2.5">
             <button
               type="button"
               onClick={toggle}
@@ -456,10 +669,18 @@ export default function MissionFilm({
         )}
       </div>
 
-      <p className="px-3 py-2 text-[10px] leading-relaxed text-moon/50">
-        Rendered live in your browser from this record&apos;s own NASA dataset values — coordinates, agency
-        and year. Drag the scene to look around.
-      </p>
+      <div className="px-1 sm:px-0">
+        <p className="py-2 text-[10px] leading-relaxed text-moon/55">
+          <span className="text-moon/80">On screen:</span> {sceneNote[phase]}
+        </p>
+        {!expanded && (
+          <p className="pb-2 text-[10px] leading-relaxed text-moon/40">
+            Rendered live from this record&apos;s own NASA dataset values. Drag the scene to look around.
+          </p>
+        )}
+      </div>
     </div>
   )
+
+  return expanded && mounted ? createPortal(card, document.body) : card
 }

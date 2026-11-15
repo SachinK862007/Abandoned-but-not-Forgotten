@@ -1,6 +1,7 @@
 'use client'
 
 import { usePathname } from 'next/navigation'
+import AmbientScore from './ambient-score'
 import Navbar from './navbar'
 import PageTransition from './page-transition'
 import SpaceBackdrop from './space-backdrop'
@@ -20,6 +21,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     <>
       {!isHome && <SpaceBackdrop />}
       {!isHome && <Navbar />}
+      {isHome && <AmbientScore />}
       <PageTransition>{children}</PageTransition>
     </>
   )
