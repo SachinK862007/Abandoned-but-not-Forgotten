@@ -20,12 +20,15 @@ yarn-error.log*
 .env*
 !.env.example
 
-# local database + upstream cache
+# legacy local database (v1) + upstream cache
 /.data/
 /.cache/
 *.db
 *.db-wal
 *.db-shm
+
+# one-off legacy mission exports (contain anonymous session ids)
+missions-export.json
 
 # vercel
 .vercel

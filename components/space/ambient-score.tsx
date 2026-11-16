@@ -1,44 +1,89 @@
 'use client'
 
-import { Music2, VolumeX } from 'lucide-react'
+import { ChevronUp, Music2, Volume2, VolumeX } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 /**
- * Home-page ambient score.
+ * Home-page ambient score with volume control.
  *
- * Original music generated with the Web Audio API — slow organ-like pads and a
- * sparse bell figure, in the spirit of a space documentary score. No audio file
- * is downloaded and nothing copyrighted is reproduced.
+ * The music itself is unchanged: four slowly breathing pad voices and a sparse
+ * bell figure, all generated with the Web Audio API. No audio file is
+ * downloaded and nothing copyrighted is reproduced.
  *
- * It is deliberately quiet (40% of an already low ceiling), starts only after a
- * real user gesture (browsers block autoplay), and exists only on "/" — the
- * component unmounts the moment you leave the homepage.
+ * Behaviour:
+ *   • 100% is the full application level (no hidden 40% multiplier). A limiter
+ *     sits before the destination so a full mix cannot clip.
+ *   • Hovering or keyboard-focusing the button reveals a compact volume slider.
+ *   • Clicking the button fades the master gain to zero over ~1.3 s and only
+ *     then suspends the AudioContext; the oscillators are never cut mid-note.
+ *   • Unmuting resumes the same graph and fades back to the stored volume.
+ *   • The chosen volume is remembered in localStorage.
+ *   • Music only starts after a real user gesture, and the component only
+ *     exists on "/" — leaving the homepage tears it down.
  */
 
-const LEVEL = 0.4
-const CEILING = 0.1
+const STORAGE_KEY = 'space-relics:volume'
+const DEFAULT_VOLUME = 100
+/** 100% maps to unity gain; quality is protected by the limiter, not a cap. */
+const MAX_GAIN = 1
+const FADE_IN_SECONDS = 1
+const FADE_OUT_SECONDS = 1.3
+const SUSPEND_AFTER_MS = Math.round(FADE_OUT_SECONDS * 1000) + 120
+
+const clampVolume = (value: number) => Math.min(100, Math.max(0, Math.round(value)))
 
 export default function AmbientScore() {
   const ctxRef = useRef<AudioContext | null>(null)
   const masterRef = useRef<GainNode | null>(null)
   const sourcesRef = useRef<OscillatorNode[]>([])
-  const timerRef = useRef<number | null>(null)
+  const noteTimerRef = useRef<number | null>(null)
+  const suspendTimerRef = useRef<number | null>(null)
   const enabledRef = useRef(true)
+  const volumeRef = useRef(DEFAULT_VOLUME)
 
   const [enabled, setEnabled] = useState(true)
+  const [volume, setVolume] = useState(DEFAULT_VOLUME)
+  const [hovered, setHovered] = useState(false)
+  const [pinned, setPinned] = useState(false)
 
-  useEffect(() => {
-    enabledRef.current = enabled
+  const open = hovered || pinned
+
+  const clearSuspendTimer = useCallback(() => {
+    if (suspendTimerRef.current !== null) {
+      window.clearTimeout(suspendTimerRef.current)
+      suspendTimerRef.current = null
+    }
+  }, [])
+
+  /**
+   * Ramps the master gain from its current value to `target` over `seconds`.
+   * Cancels any earlier automation first, so rapid clicks never stack ramps.
+   */
+  const ramp = useCallback((target: number, seconds: number) => {
     const ctx = ctxRef.current
     const master = masterRef.current
     if (!ctx || !master) return
-    master.gain.setTargetAtTime(enabled ? LEVEL * CEILING : 0, ctx.currentTime, 0.6)
-  }, [enabled])
+    const now = ctx.currentTime
+    const gain = master.gain
+    if (typeof gain.cancelAndHoldAtTime === 'function') {
+      gain.cancelAndHoldAtTime(now)
+    } else {
+      const current = gain.value
+      gain.cancelScheduledValues(now)
+      gain.setValueAtTime(current, now)
+    }
+    if (seconds <= 0) {
+      gain.setValueAtTime(target, now)
+      return
+    }
+    gain.linearRampToValueAtTime(target, now + seconds)
+  }, [])
 
   const stop = useCallback(() => {
-    if (timerRef.current) {
-      window.clearInterval(timerRef.current)
-      timerRef.current = null
+    clearSuspendTimer()
+    if (noteTimerRef.current !== null) {
+      window.clearInterval(noteTimerRef.current)
+      noteTimerRef.current = null
     }
     for (const source of sourcesRef.current) {
       try {
@@ -49,22 +94,38 @@ export default function AmbientScore() {
       }
     }
     sourcesRef.current = []
-    ctxRef.current?.close().catch(() => undefined)
+    const ctx = ctxRef.current
     ctxRef.current = null
     masterRef.current = null
-  }, [])
+    if (ctx && ctx.state !== 'closed') void ctx.close().catch(() => undefined)
+  }, [clearSuspendTimer])
 
   const start = useCallback(() => {
-    if (ctxRef.current) return
+    const existing = ctxRef.current
+    if (existing) {
+      void existing.resume().catch(() => undefined)
+      return
+    }
+
     const Ctor =
       window.AudioContext ??
       (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
     if (!Ctor) return
 
     const ctx = new Ctor()
+
+    // Safety limiter: protects audio quality at 100% instead of capping volume.
+    const limiter = ctx.createDynamicsCompressor()
+    limiter.threshold.value = -4
+    limiter.knee.value = 6
+    limiter.ratio.value = 12
+    limiter.attack.value = 0.003
+    limiter.release.value = 0.25
+    limiter.connect(ctx.destination)
+
     const master = ctx.createGain()
     master.gain.value = 0
-    master.connect(ctx.destination)
+    master.connect(limiter)
     masterRef.current = master
     ctxRef.current = ctx
 
@@ -134,9 +195,77 @@ export default function AmbientScore() {
       osc.start(now)
       osc.stop(now + 5.6)
     }
-    timerRef.current = window.setInterval(playNote, 2900)
+    noteTimerRef.current = window.setInterval(playNote, 2900)
 
-    master.gain.setTargetAtTime(enabledRef.current ? LEVEL * CEILING : 0, ctx.currentTime, 1.8)
+    const target = enabledRef.current ? (volumeRef.current / 100) * MAX_GAIN : 0
+    master.gain.linearRampToValueAtTime(target, ctx.currentTime + 2.2)
+    void ctx.resume().catch(() => undefined)
+  }, [])
+
+  const toggle = useCallback(() => {
+    const ctx = ctxRef.current
+    if (!ctx) {
+      enabledRef.current = true
+      setEnabled(true)
+      start()
+      return
+    }
+
+    clearSuspendTimer()
+
+    if (enabledRef.current) {
+      // Fade first, suspend only after the tail has reached zero.
+      enabledRef.current = false
+      setEnabled(false)
+      ramp(0, FADE_OUT_SECONDS)
+      suspendTimerRef.current = window.setTimeout(() => {
+        suspendTimerRef.current = null
+        if (enabledRef.current) return
+        const active = ctxRef.current
+        if (active && active.state === 'running') void active.suspend().catch(() => undefined)
+      }, SUSPEND_AFTER_MS)
+      return
+    }
+
+    enabledRef.current = true
+    setEnabled(true)
+    const target = (volumeRef.current / 100) * MAX_GAIN
+    void ctx
+      .resume()
+      .then(() => ramp(target, FADE_IN_SECONDS))
+      .catch(() => ramp(target, 0))
+  }, [clearSuspendTimer, ramp, start])
+
+  const changeVolume = useCallback(
+    (next: number) => {
+      const value = clampVolume(next)
+      volumeRef.current = value
+      setVolume(value)
+      try {
+        window.localStorage.setItem(STORAGE_KEY, String(value))
+      } catch {
+        // Storage can be blocked (private mode); the session still works.
+      }
+      // Changing volume while muted only records the preference.
+      if (enabledRef.current) ramp((value / 100) * MAX_GAIN, 0.08)
+    },
+    [ramp],
+  )
+
+  // Restore the saved preference after hydration (server and client both render
+  // 100% first, so there is no mismatch).
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEY)
+      if (raw === null) return
+      const parsed = Number(raw)
+      if (!Number.isFinite(parsed)) return
+      const value = clampVolume(parsed)
+      volumeRef.current = value
+      setVolume(value)
+    } catch {
+      // ignore
+    }
   }, [])
 
   // Autoplay policy: audio may only begin after a real gesture.
@@ -153,22 +282,67 @@ export default function AmbientScore() {
   useEffect(() => stop, [stop])
 
   return (
-    <button
-      type="button"
-      onClick={() => {
-        if (!ctxRef.current) {
-          start()
-          setEnabled(true)
-          return
-        }
-        setEnabled((value) => !value)
+    <div
+      className="fixed bottom-5 right-5 z-40 flex flex-col items-end"
+      onPointerEnter={() => setHovered(true)}
+      onPointerLeave={() => setHovered(false)}
+      onFocusCapture={() => setHovered(true)}
+      onBlurCapture={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setHovered(false)
       }}
-      aria-pressed={enabled}
-      aria-label={enabled ? 'Mute ambient score' : 'Play ambient score'}
-      title="Ambient score · 40%"
-      className="fixed bottom-5 right-5 z-40 flex size-10 items-center justify-center rounded-full border border-orbit/30 bg-void/70 text-moon backdrop-blur transition-colors hover:border-electric/60 hover:text-starlight"
     >
-      {enabled ? <Music2 className="size-4" aria-hidden /> : <VolumeX className="size-4" aria-hidden />}
-    </button>
+      {/* Volume panel: stays attached to the button, revealed on hover/focus or
+          pinned on touch. The bottom padding bridges the gap so moving the
+          pointer from the icon to the slider never dismisses it. */}
+      <div
+        id="ambient-score-volume"
+        className={`absolute bottom-full right-0 pb-2 transition-all duration-200 ease-out motion-reduce:transition-none ${
+          open ? 'pointer-events-auto translate-y-0 opacity-100' : 'pointer-events-none translate-y-1 opacity-0'
+        }`}
+      >
+        <div className="flex items-center gap-2 rounded-full border border-orbit/30 bg-void/80 px-3 py-2 text-moon shadow-lg backdrop-blur">
+          <Volume2 className="size-3.5 shrink-0 text-moon/80" aria-hidden />
+          <input
+            type="range"
+            min={0}
+            max={100}
+            step={1}
+            value={volume}
+            onChange={(event) => changeVolume(Number(event.target.value))}
+            tabIndex={open ? 0 : -1}
+            aria-label="Ambient score volume"
+            aria-valuetext={`${volume} percent`}
+            className="h-4 w-24 cursor-pointer accent-electric focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric/70"
+          />
+          <span className="w-9 text-right font-display text-[10px] tabular-nums tracking-[0.08em] text-moon">
+            {volume}%
+          </span>
+        </div>
+      </div>
+
+      {/* Touch devices have no hover: a small chevron reveals the slider without
+          touching the mute action. Hidden wherever hovering is possible. */}
+      <button
+        type="button"
+        onClick={() => setPinned((value) => !value)}
+        aria-expanded={open}
+        aria-controls="ambient-score-volume"
+        aria-label={open ? 'Hide volume control' : 'Show volume control'}
+        className="mb-2 hidden size-7 items-center justify-center rounded-full border border-orbit/30 bg-void/70 text-moon backdrop-blur transition-colors hover:border-electric/60 hover:text-starlight focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric/70 [@media(hover:none)]:flex"
+      >
+        <ChevronUp className={`size-3.5 transition-transform ${open ? 'rotate-180' : ''}`} aria-hidden />
+      </button>
+
+      <button
+        type="button"
+        onClick={toggle}
+        aria-pressed={enabled}
+        aria-label={enabled ? 'Mute ambient score' : 'Play ambient score'}
+        title={`Ambient score · ${volume}%`}
+        className="flex size-10 items-center justify-center rounded-full border border-orbit/30 bg-void/70 text-moon backdrop-blur transition-colors hover:border-electric/60 hover:text-starlight focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric/70 focus-visible:ring-offset-2 focus-visible:ring-offset-void"
+      >
+        {enabled ? <Music2 className="size-4" aria-hidden /> : <VolumeX className="size-4" aria-hidden />}
+      </button>
+    </div>
   )
 }
