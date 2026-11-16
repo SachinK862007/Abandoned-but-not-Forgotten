@@ -18,8 +18,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
  *     then suspends the AudioContext; the oscillators are never cut mid-note.
  *   • Unmuting resumes the same graph and fades back to the stored volume.
  *   • The chosen volume is remembered in localStorage.
- *   • Music only starts after a real user gesture, and the component only
- *     exists on "/" — leaving the homepage tears it down.
+ *   • Music starts automatically on every visit to "/" (browsers still need a
+ *     gesture once, so the score is armed and unlocks on the first interaction,
+ *     on focus and on a slow retry). The component only exists on "/" —
+ *     leaving the homepage tears it down, and coming back starts it again.
  */
 
 const STORAGE_KEY = 'space-relics:volume'
@@ -268,14 +270,42 @@ export default function AmbientScore() {
     }
   }, [])
 
-  // Autoplay policy: audio may only begin after a real gesture.
+  // Autoplay: the score should be playing whenever somebody arrives on the home
+  // page. Browsers refuse to start audio without engagement, so this tries
+  // immediately, then unlocks on the first gesture of any kind, again when the
+  // tab is brought back, and on a slow retry — and it stays armed, so the music
+  // always ends up playing unless the visitor muted it here.
   useEffect(() => {
-    const onGesture = () => start()
-    window.addEventListener('pointerdown', onGesture, { once: true })
-    window.addEventListener('keydown', onGesture, { once: true })
+    let cancelled = false
+
+    const unlock = () => {
+      if (cancelled || !enabledRef.current) return
+      const ctx = ctxRef.current
+      if (!ctx) {
+        start()
+        return
+      }
+      if (ctx.state === 'suspended') void ctx.resume().catch(() => undefined)
+    }
+
+    unlock()
+
+    const gestures = ['pointerdown', 'pointermove', 'keydown', 'wheel', 'touchstart', 'scroll'] as const
+    for (const type of gestures) window.addEventListener(type, unlock, { passive: true })
+    window.addEventListener('focus', unlock)
+    document.addEventListener('visibilitychange', unlock)
+
+    const retry = window.setInterval(() => {
+      const ctx = ctxRef.current
+      if (!ctx || ctx.state !== 'running') unlock()
+    }, 2500)
+
     return () => {
-      window.removeEventListener('pointerdown', onGesture)
-      window.removeEventListener('keydown', onGesture)
+      cancelled = true
+      for (const type of gestures) window.removeEventListener(type, unlock)
+      window.removeEventListener('focus', unlock)
+      document.removeEventListener('visibilitychange', unlock)
+      window.clearInterval(retry)
     }
   }, [start])
 
