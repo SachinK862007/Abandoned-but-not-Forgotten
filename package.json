@@ -2,7 +2,7 @@
   "name": "space-relics",
   "version": "1.0.0",
   "private": true,
-  "description": "Space Relics — Abandoned but Not Forgotten. Next.js shell + relic API + Launch Lab / Planet Explorer 3D apps.",
+  "description": "Space Relics \u2014 Abandoned but Not Forgotten. Next.js shell + relic API + Launch Lab / Planet Explorer 3D apps.",
   "engines": {
     "node": ">=22.5.0"
   },
@@ -19,11 +19,14 @@
     "db:export-sqlite": "node scripts/export-sqlite.mjs",
     "db:import": "node scripts/import-missions.mjs",
     "test:sim": "node --test \"Lonch game/launch-lab/test/sim.test.mjs\"",
-    "test:db": "node --test test/db.test.mjs"
+    "test:db": "node --test test/db.test.mjs test/migration.test.mjs",
+    "test:http": "node --test test/http.test.mjs",
+    "test:rate-limit": "node --test test/rate-limit.test.mjs",
+    "test:all": "npm run test:sim && npm run test:db && npm run test:http && npm run test:rate-limit"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
-    "@neondatabase/serverless": "^0.10.4",
+    "@neondatabase/serverless": "^1.2.1",
     "@react-three/fiber": "^9.8.2",
     "@upstash/ratelimit": "^2.2.1",
     "@upstash/redis": "^1.41.0",

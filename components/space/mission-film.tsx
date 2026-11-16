@@ -207,7 +207,7 @@ const PARTS: Record<VehicleKind, Part[]> = {
   rover: [
     { label: 'Cameras', detail: 'Cameras ride high on the mast. They are the rover’s eyes for choosing the next rock.' },
     { label: 'Power', detail: 'Solar panels, or a small nuclear unit, keep the instruments running through the cold nights.' },
-    { label: 'Wheels', detail: 'Six wheels, each with its own motor, so it can climb rocks and crawl out of soft dust.' },
+    { label: 'Wheels', detail: 'The wheels are independently driven and steered, letting the rover climb rocks and crawl out of soft dust.' },
   ],
   crewed: [
     { label: 'Capsule', detail: 'The capsule holds the crew and everything that keeps them alive.' },
@@ -336,6 +336,12 @@ export default function MissionFilm({
   const [progress, setProgress] = useState(0)
   const [beat, setBeat] = useState(0)
   const [failed, setFailed] = useState(false)
+
+  // A failed film for one relic must never bleed into the next one. Reset the
+  // failure (and loading) state whenever the selected relic changes.
+  useEffect(() => {
+    setFailed(false)
+  }, [relic.id])
   const [expanded, setExpanded] = useState(false)
   const [voice, setVoice] = useState(true)
   const [captions, setCaptions] = useState(true)
@@ -360,6 +366,7 @@ export default function MissionFilm({
   const speechBusyRef = useRef(false)
   const speechStartedRef = useRef(0)
   const beatRef = useRef(0)
+  const renderScheduleRef = useRef<(() => void) | null>(null)
 
   const vehicle = useMemo(() => vehicleFor(relic), [relic])
   const vehicleName = VEHICLE_NAME[vehicle]
@@ -369,6 +376,7 @@ export default function MissionFilm({
 
   useEffect(() => {
     playingRef.current = playing
+    if (playing) renderScheduleRef.current?.()
   }, [playing])
 
   useEffect(() => {
@@ -1174,6 +1182,8 @@ export default function MissionFilm({
         dragYaw += (event.clientX - lastX) * 0.007
         dragYaw = Math.max(-1.4, Math.min(1.4, dragYaw))
         lastX = event.clientX
+        // Keep the view live while dragging, even when playback is paused.
+        renderScheduleRef.current?.()
       }
       const onUp = (event: PointerEvent) => {
         const wasDrag = Math.abs(event.clientX - downX) > 6 || Math.abs(event.clientY - downY) > 6
@@ -1202,6 +1212,7 @@ export default function MissionFilm({
         renderer.setSize(w, h, false)
         camera.aspect = w / h
         camera.updateProjectionMatrix()
+        renderScheduleRef.current?.()
       }
       const observer = new ResizeObserver(resize)
       observer.observe(stage)
@@ -1241,7 +1252,7 @@ export default function MissionFilm({
         camera.lookAt(lookAt)
       }
 
-      const loop = () => {
+      const tick = () => {
         if (disposed) return
         const now = performance.now()
         const dt = Math.min(0.05, (now - last) / 1000)
@@ -1550,11 +1561,17 @@ export default function MissionFilm({
         }
 
         renderer.render(scene, camera)
-        raf = requestAnimationFrame(loop)
+        if (playingRef.current) schedule()
       }
-      raf = requestAnimationFrame(loop)
+      const schedule = () => {
+        if (disposed || raf) return
+        raf = requestAnimationFrame(tick)
+      }
+      renderScheduleRef.current = schedule
+      schedule()
 
       teardown = () => {
+        renderScheduleRef.current = null
         observer.disconnect()
         observerRef.current = null
         observedStageRef.current = null
@@ -1576,6 +1593,7 @@ export default function MissionFilm({
 
     return () => {
       disposed = true
+      renderScheduleRef.current = null
       cancelAnimationFrame(raf)
       teardown?.()
     }
@@ -1625,6 +1643,7 @@ export default function MissionFilm({
     setBeat(beatIndexAt(clamped))
     setProgress(Math.round((clamped / DURATION) * 100))
     setActive(true)
+    renderScheduleRef.current?.()
   }, [])
 
   const seekTo = useCallback(
@@ -1811,6 +1830,12 @@ export default function MissionFilm({
         {active && !failed && captions && (
           <p className="pointer-events-none absolute inset-x-0 bottom-12 mx-auto max-w-[92%] rounded-lg bg-void/75 px-3 py-1.5 text-center text-[11px] leading-snug text-starlight/90">
             {current.narration}
+          </p>
+        )}
+
+        {active && !failed && (
+          <p className="pointer-events-none absolute bottom-10 left-2.5 max-w-[60%] font-mono text-[8px] leading-snug text-moon/45">
+            Illustrative mission sequence. Visual stages are simplified representations and may not reproduce the exact historical flight profile.
           </p>
         )}
 

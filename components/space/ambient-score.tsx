@@ -18,15 +18,12 @@ import { useCallback, useEffect, useRef, useState } from 'react'
  *     then suspends the AudioContext; the oscillators are never cut mid-note.
  *   • Unmuting resumes the same graph and fades back to the stored volume.
  *   • The chosen volume is remembered in localStorage.
- *   • Music starts automatically on every visit to "/" (browsers still need a
- *     gesture once, so the score is armed and unlocks on the first interaction,
- *     on focus and on a slow retry). The component only exists on "/" —
- *     leaving the homepage tears it down, and coming back starts it again.
+ *   • The score is silent until the visitor deliberately starts it (music
+ *     button). The component only exists on "/" — leaving the homepage tears it
+ *     down, and coming back starts from a clean, silent state.
  */
 
 const STORAGE_KEY = 'space-relics:volume'
-/** Mute is remembered for the tab, so reopening home cannot unmute by itself. */
-const MUTED_KEY = 'space-relics:muted'
 const DEFAULT_VOLUME = 100
 /** 100% maps to unity gain; quality is protected by the limiter, not a cap. */
 const MAX_GAIN = 1
@@ -225,11 +222,6 @@ export default function AmbientScore() {
       // context suspended — rather than relying on the fade alone.
       enabledRef.current = false
       setEnabled(false)
-      try {
-        window.sessionStorage.setItem(MUTED_KEY, '1')
-      } catch {
-        // storage can be blocked; muting still works for this page
-      }
       ramp(0, MUTE_FADE_SECONDS)
       if (noteTimerRef.current !== null) {
         window.clearInterval(noteTimerRef.current)
@@ -240,9 +232,10 @@ export default function AmbientScore() {
         if (enabledRef.current) return
         const active = ctxRef.current
         const master = masterRef.current
-        if (master) {
-          master.gain.cancelScheduledValues(0)
-          master.gain.setValueAtTime(0, 0)
+        if (active && master) {
+          const now = active.currentTime
+          master.gain.cancelScheduledValues(now)
+          master.gain.setValueAtTime(0, now)
         }
         if (active && active.state === 'running') void active.suspend().catch(() => undefined)
       }, Math.round(MUTE_FADE_SECONDS * 1000) + 120)
@@ -251,11 +244,6 @@ export default function AmbientScore() {
 
     enabledRef.current = true
     setEnabled(true)
-    try {
-      window.sessionStorage.removeItem(MUTED_KEY)
-    } catch {
-      // ignore
-    }
     if (noteTimerRef.current === null && playNoteRef.current) {
       noteTimerRef.current = window.setInterval(() => playNoteRef.current?.(), 2900)
     }
@@ -282,18 +270,6 @@ export default function AmbientScore() {
     [ramp],
   )
 
-  // A mute chosen in this tab sticks for the tab.
-  useEffect(() => {
-    try {
-      if (window.sessionStorage.getItem(MUTED_KEY) === '1') {
-        enabledRef.current = false
-        setEnabled(false)
-      }
-    } catch {
-      // storage blocked: default to playing
-    }
-  }, [])
-
   // Restore the saved preference after hydration (server and client both render
   // 100% first, so there is no mismatch).
   useEffect(() => {
@@ -310,44 +286,11 @@ export default function AmbientScore() {
     }
   }, [])
 
-  // Autoplay: the score should be playing whenever somebody arrives on the home
-  // page. Browsers refuse to start audio without engagement, so this tries
-  // immediately, then unlocks on the first gesture of any kind, again when the
-  // tab is brought back, and on a slow retry — and it stays armed, so the music
-  // always ends up playing unless the visitor muted it here.
-  useEffect(() => {
-    let cancelled = false
-
-    const unlock = () => {
-      if (cancelled || !enabledRef.current) return
-      const ctx = ctxRef.current
-      if (!ctx) {
-        start()
-        return
-      }
-      if (ctx.state === 'suspended') void ctx.resume().catch(() => undefined)
-    }
-
-    unlock()
-
-    const gestures = ['pointerdown', 'pointermove', 'keydown', 'wheel', 'touchstart', 'scroll'] as const
-    for (const type of gestures) window.addEventListener(type, unlock, { passive: true })
-    window.addEventListener('focus', unlock)
-    document.addEventListener('visibilitychange', unlock)
-
-    const retry = window.setInterval(() => {
-      const ctx = ctxRef.current
-      if (!ctx || ctx.state !== 'running') unlock()
-    }, 2500)
-
-    return () => {
-      cancelled = true
-      for (const type of gestures) window.removeEventListener(type, unlock)
-      window.removeEventListener('focus', unlock)
-      document.removeEventListener('visibilitychange', unlock)
-      window.clearInterval(retry)
-    }
-  }, [start])
+  // Audio is started only by an explicit user gesture (the music button, or the
+  // volume control). No passive unlock listeners, no timers, no autoplay: this
+  // respects browser autoplay rules and never surprises a visitor with sound.
+  // The component only lives on "/", so leaving the homepage tears everything
+  // down and coming back starts from a clean, silent state.
 
   useEffect(() => stop, [stop])
 
