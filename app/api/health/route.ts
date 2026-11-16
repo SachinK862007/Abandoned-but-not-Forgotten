@@ -1,13 +1,18 @@
-import { countMissions } from '@/lib/missions'
-import { migrationStatus } from '@/lib/db'
-import { relicCounts } from '@/lib/relics'
+import { isDatabaseConfigured, pingDatabase } from '@/lib/db'
 import { fail, ok } from '@/lib/http'
+import { relicCounts } from '@/lib/relics'
 import type { HealthReport } from '@/lib/types'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-/** Simple service status. Never exposes credentials, paths or stack traces. */
+/**
+ * Minimal service status: is the app reachable, is storage available, is the
+ * public dataset readable, how long did the probe take.
+ *
+ * Deliberately excluded: connection strings, database or filesystem paths,
+ * environment values, stack traces, and any global mission or user statistic.
+ */
 export async function GET() {
   const started = Date.now()
   const checks: HealthReport['checks'] = {
@@ -16,14 +21,10 @@ export async function GET() {
   }
 
   try {
-    const status = migrationStatus()
-    const missions = countMissions()
-    checks.database = {
-      ok: true,
-      detail: `sqlite · ${status.applied.length} migration${status.applied.length === 1 ? '' : 's'} applied · ${missions} saved mission${missions === 1 ? '' : 's'}`,
-    }
+    await pingDatabase()
+    checks.database = { ok: true, detail: 'available' }
   } catch {
-    checks.database = { ok: false, detail: 'database unreachable' }
+    checks.database = { ok: false, detail: isDatabaseConfigured() ? 'unavailable' : 'not configured' }
   }
 
   try {
