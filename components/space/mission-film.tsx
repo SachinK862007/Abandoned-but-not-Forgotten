@@ -1,30 +1,44 @@
 'use client'
 
 import type * as ThreeTypes from 'three'
-import { Captions, Maximize2, Minimize2, Pause, Play, RotateCcw, Volume2, VolumeX, X } from 'lucide-react'
+import {
+  Captions,
+  ChevronLeft,
+  ChevronRight,
+  Gauge,
+  Maximize2,
+  Minimize2,
+  Pause,
+  Play,
+  RotateCcw,
+  Volume2,
+  VolumeX,
+  X,
+} from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { Relic } from '@/lib/types'
 
 /**
- * Mission film: a short 3D cinematic generated in the browser from the relic's
- * own dataset values — the target body, the published landing coordinates, the
- * agency, the year and the recorded hardware class.
+ * Mission film — a ten-chapter 3D story generated in the browser.
  *
- * Nothing is fetched, nothing navigates away, and no mission fact is invented:
- * the film visualises the record you are reading, narrates it out loud, and can
- * be expanded to fill the window without losing playback.
+ * The film follows the hardware from "what is this machine?" to "what did it do
+ * after it landed", using only facts the record itself carries (name, agency,
+ * year, hardware class, target body, published landing coordinates) plus the
+ * definition of what that class of spacecraft does. Nothing is fetched and
+ * nothing is invented.
+ *
+ * Chapters can be jumped to at any time, the scene can be dragged to look
+ * around, playback speed changes, and narration holds each shot until the line
+ * has been spoken.
  */
-
-const DURATION = 11
-const T_INBOUND = 1.4
-const T_IMPACT = 4.2
-const T_REVEAL = 5.4
 
 const BODY_TEXTURE: Record<Relic['planet'], string> = {
   moon: '/space/textures/moon.jpg',
   mars: '/space/textures/mars.jpg',
 }
+
+const EARTH_TEXTURE = '/space/textures/earth.jpg'
 
 const BODY_TINT: Record<Relic['planet'], number> = {
   moon: 0xb6c1d4,
@@ -36,16 +50,41 @@ const BODY_LABEL: Record<Relic['planet'], string> = {
   mars: 'Mars',
 }
 
-const PHASE_LABEL = ['Approach', 'Terminal descent', 'Touchdown', 'Site locked'] as const
-
 type VehicleKind = 'rover' | 'crewed' | 'sample' | 'satellite' | 'lander'
 
 const VEHICLE_NAME: Record<VehicleKind, string> = {
   rover: 'rover',
   crewed: 'crewed capsule',
   sample: 'sample-return capsule',
-  satellite: 'satellite bus',
+  satellite: 'orbiter',
   lander: 'lander',
+}
+
+type Shot = 'vehicle' | 'closeup' | 'pad' | 'ascent' | 'staging' | 'cruise' | 'descent' | 'touchdown' | 'surface' | 'legacy'
+
+const BEATS: { id: string; label: string; seconds: number; shot: Shot }[] = [
+  { id: 'meet', label: 'Meet the machine', seconds: 9, shot: 'vehicle' },
+  { id: 'inside', label: 'How it works', seconds: 10, shot: 'closeup' },
+  { id: 'pad', label: 'On the pad', seconds: 7, shot: 'pad' },
+  { id: 'liftoff', label: 'Liftoff', seconds: 7, shot: 'ascent' },
+  { id: 'staging', label: 'Staging', seconds: 8, shot: 'staging' },
+  { id: 'cruise', label: 'The voyage', seconds: 8, shot: 'cruise' },
+  { id: 'descent', label: 'Descent', seconds: 8, shot: 'descent' },
+  { id: 'touchdown', label: 'Touchdown', seconds: 6, shot: 'touchdown' },
+  { id: 'after', label: 'After landing', seconds: 10, shot: 'surface' },
+  { id: 'legacy', label: 'What remains', seconds: 6, shot: 'legacy' },
+]
+
+const STARTS: number[] = []
+BEATS.reduce((acc, beat) => {
+  STARTS.push(acc)
+  return acc + beat.seconds
+}, 0)
+const DURATION = BEATS.reduce((sum, beat) => sum + beat.seconds, 0)
+
+function beatIndexAt(t: number) {
+  for (let i = BEATS.length - 1; i >= 0; i -= 1) if (t >= STARTS[i]) return i
+  return 0
 }
 
 /** Pick the hardware model that matches the record's own class. */
@@ -60,6 +99,11 @@ function vehicleFor(relic: Relic): VehicleKind {
 
 function easeInOut(x: number) {
   return x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2
+}
+
+function smoothstep(from: number, to: number, x: number) {
+  const t = Math.max(0, Math.min(1, (x - from) / (to - from)))
+  return t * t * (3 - 2 * t)
 }
 
 /** Lat/lon → a point on a sphere (dataset coordinates, degrees). */
@@ -77,6 +121,155 @@ function fmtCoord(value: number, positive: string, negative: string) {
   return `${Math.abs(value).toFixed(2)}° ${value >= 0 ? positive : negative}`
 }
 
+type BeatScript = { title: string; narration: string; note: string }
+
+type CraftCopy = {
+  noun: string
+  meet: string
+  parts: string
+  after: string
+  legacy: string
+  surfaceNote: string
+}
+
+/**
+ * What each class of hardware is and what it did after landing.
+ *
+ * Every line is either read from the record ({name}, {agency}, {year}, {kind},
+ * {body}, {where}) or is the defining job of that spacecraft class — a rover
+ * drives, a lander stays put, a sample-return mission brings material home.
+ */
+const CRAFT: Record<VehicleKind, CraftCopy> = {
+  rover: {
+    noun: 'rover',
+    meet: 'Meet {name}. {agency} sent this rover to {body} in {year}. A rover is a robot on wheels: it lands once, then drives from place to place instead of studying a single spot.',
+    parts:
+      'Here is how it works. The body carries the cameras, drills and science instruments. A power source — solar panels or a small nuclear unit — keeps them running. Each wheel has its own motor, so it can climb over rocks and crawl out of soft dust. The dish on top is how it talks to Earth.',
+    after:
+      'And this is the part that matters. After landing, the rover does not stay put. It rolls off its platform and drives, stopping at rocks to photograph them, drill into them and measure the ground. Every day it sends those findings home through its dish, and people on Earth decide where it should drive next.',
+    legacy:
+      'The rover is still up there at {where}: a machine parked in the dust of {body}, after showing us what that world is really made of.',
+    surfaceNote: 'The rover rolls away from the landing site, leaving wheel tracks across the surface.',
+  },
+  crewed: {
+    noun: 'crewed spacecraft',
+    meet: 'Meet {name}. {agency}, {year}. This is a crewed mission — it carried people. That changes everything: the spacecraft needs a capsule to keep them alive, and a way to bring them home again.',
+    parts:
+      'Here is how it works. The capsule holds the crew and their life support. A heat shield protects them on the way down through air. Behind it, a service section carries the engines, fuel and power, and landing legs set the whole thing down gently.',
+    after:
+      'After landing, the crew gets to work. They step onto the surface, set up experiments, collect rock and soil, take photographs, and leave instruments behind that keep measuring long after the crew has gone home.',
+    legacy:
+      'The descent stage stayed behind at {where}. The record lists it as {kind}, and it is still there, exactly where the crew left it.',
+    surfaceNote: 'Footprints spread out from the lander as the crew works across the site.',
+  },
+  sample: {
+    noun: 'sample-return spacecraft',
+    meet: 'Meet {name}. {agency}, {year}. A sample-return mission has a round trip in mind: land on {body}, pick up pieces of it, and bring them back to Earth.',
+    parts:
+      'Here is how it works. One part lands and collects. Another part is a small rocket that lifts the sealed sample off the surface. A capsule carries it home through Earth’s atmosphere, protected by a heat shield.',
+    after:
+      'After landing, the collector scoops and drills material from the surface and seals it in a container. Then the ascent stage launches that container back into space, and scientists study the pieces in laboratories on Earth.',
+    legacy:
+      'What stays behind at {where} is the part that did the landing. The sample itself made the journey home.',
+    surfaceNote: 'A small ascent stage lifts the sealed sample away from the landing site.',
+  },
+  lander: {
+    noun: 'lander',
+    meet: 'Meet {name}. {agency}, {year}. This is a lander: a spacecraft built to touch down, and then do its work from one place.',
+    parts:
+      'Here is how it works. A descent engine slows the fall and the legs absorb the touchdown. Once it is down, solar panels unfold for power and a dish points at Earth. Its instruments are fixed in place, so the landing site itself becomes the laboratory.',
+    after:
+      'After landing, it stays exactly where it touched down. It unfolds its instruments, measures the ground, the sky and the weather, and sends the results back to Earth for as long as it can.',
+    legacy: 'It is still at {where}, on the surface of {body}: the record lists it as {kind}.',
+    surfaceNote: 'The lander stays put while its dish keeps sending data home.',
+  },
+  satellite: {
+    noun: 'spacecraft',
+    meet: 'Meet {name}. {agency}, {year}. This spacecraft was built to reach {body} and work from close orbit rather than from the ground.',
+    parts:
+      'Here is how it works. A body holds the instruments, solar panels make the power, and a dish sends data back. Small engines make the corrections that keep it on course.',
+    after:
+      'After arriving, it settles into its planned orbit and begins mapping, photographing and measuring, pass after pass, sending the data home.',
+    legacy: 'Its mission ended above {body}; the record ties it to {kind}.',
+    surfaceNote: 'The spacecraft works from orbit, circling the world below.',
+  },
+}
+
+function fill(template: string, values: Record<string, string>) {
+  return template.replace(/\{(\w+)\}/g, (_, key: string) => values[key] ?? '')
+}
+
+function scriptFor(relic: Relic, vehicle: VehicleKind): BeatScript[] {
+  const craft = CRAFT[vehicle]
+  const values = {
+    name: relic.name,
+    agency: relic.agency,
+    year: String(relic.year),
+    body: BODY_LABEL[relic.planet],
+    kind: relic.kind,
+    where: `${fmtCoord(relic.latitude, 'N', 'S')}, ${fmtCoord(relic.longitude, 'E', 'W')}`,
+    noun: craft.noun,
+  }
+  const say = (text: string) => fill(text, values)
+
+  return [
+    { title: BEATS[0].label, narration: say(craft.meet), note: `A slow turn around the ${craft.noun}, lit against the stars.` },
+    {
+      title: BEATS[1].label,
+      narration: say(craft.parts),
+      note: 'A close pass over the body, the power source and the dish on top.',
+    },
+    {
+      title: BEATS[2].label,
+      narration: say(
+        'A {noun} cannot get to {body} on its own. It rides a rocket: the nose cone on top, the lander that will set it down, and underneath, the tanks and engines that lift the whole stack off Earth.',
+      ),
+      note: `${relic.name} stacked on its launch vehicle, with Earth filling the frame.`,
+    },
+    {
+      title: BEATS[3].label,
+      narration: say(
+        'Engines light. Thrust beats the rocket’s own weight, so it climbs. As the fuel burns the stack gets lighter, and it moves faster and faster.',
+      ),
+      note: 'The stack climbs on a column of flame; the launch tower falls behind.',
+    },
+    {
+      title: BEATS[4].label,
+      narration: say(
+        'An empty tank is dead weight. The spent booster drops away and the next engine takes over. The nose cone splits open, and the {noun} is out in space.',
+      ),
+      note: 'The spent booster tumbles away as the nose cone opens.',
+    },
+    {
+      title: BEATS[5].label,
+      narration: say(
+        'Now it coasts. In space there is nothing to push against — the engines finished their work long ago. {body} grows from a tiny dot into a whole world ahead.',
+      ),
+      note: `Earth behind, ${BODY_LABEL[relic.planet]} ahead, the spacecraft coasting between them.`,
+    },
+    {
+      title: BEATS[6].label,
+      narration: say(
+        'Arrival is the hard part. The lander has to shed almost all of its speed, then steer down to the published coordinates: {where}.',
+      ),
+      note: 'Over the landing site, easing down toward the documented coordinates.',
+    },
+    {
+      title: BEATS[7].label,
+      narration: say(
+        'Contact. The legs take the last of the fall, dust kicks out, and the engines cut. The record lists this as {kind}.',
+      ),
+      note: 'Contact at the documented coordinates; a dust ring spreads across the surface.',
+    },
+    { title: BEATS[8].label, narration: say(craft.after), note: craft.surfaceNote },
+    {
+      title: BEATS[9].label,
+      narration: say(craft.legacy),
+      note: 'The site marker stays fixed on the surface at the published coordinates.',
+    },
+  ]
+}
+
 export default function MissionFilm({
   relic,
   autoPlayToken = 0,
@@ -87,51 +280,41 @@ export default function MissionFilm({
   const [active, setActive] = useState(false)
   const [playing, setPlaying] = useState(false)
   const [progress, setProgress] = useState(0)
-  const [phase, setPhase] = useState(0)
+  const [beat, setBeat] = useState(0)
   const [failed, setFailed] = useState(false)
   const [expanded, setExpanded] = useState(false)
   const [voice, setVoice] = useState(true)
   const [captions, setCaptions] = useState(true)
+  const [speed, setSpeed] = useState(1)
   const [mounted, setMounted] = useState(false)
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const stageRef = useRef<HTMLDivElement | null>(null)
   const playingRef = useRef(false)
   const elapsedRef = useRef(0)
+  const speedRef = useRef(1)
+  const voiceRef = useRef(true)
+  const speechBusyRef = useRef(false)
+  const speechStartedRef = useRef(0)
 
   const vehicle = useMemo(() => vehicleFor(relic), [relic])
   const vehicleName = VEHICLE_NAME[vehicle]
-  const latText = fmtCoord(relic.latitude, 'N', 'S')
-  const lonText = fmtCoord(relic.longitude, 'E', 'W')
-
-  /** Spoken + written explanation for each beat of the film. */
-  const narration = useMemo(
-    () => [
-      `${relic.name}. ${relic.agency}, ${relic.year}. Approaching ${BODY_LABEL[relic.planet]}.`,
-      `A ${vehicleName} descends toward the published landing coordinates: ${latText}, ${lonText}.`,
-      `Touchdown. The record lists this as: ${relic.kind}.`,
-      `Site locked. Marker placed from the NASA dataset coordinates. That is the ${relic.name} story.`,
-    ],
-    [relic.name, relic.agency, relic.year, relic.planet, relic.kind, vehicleName, latText, lonText],
-  )
-
-  /** Plain-language note describing what is on screen right now. */
-  const sceneNote = useMemo(
-    () => [
-      `A textured globe of ${BODY_LABEL[relic.planet]} with the descent track beginning out in space.`,
-      `The ${vehicleName} rides the track down to ${latText}, ${lonText}.`,
-      `A ring marks the touchdown point named in the dataset.`,
-      `The site marker stays fixed on the surface at the documented coordinates.`,
-    ],
-    [relic.planet, vehicleName, latText, lonText],
-  )
+  const script = useMemo(() => scriptFor(relic, vehicle), [relic, vehicle])
+  const current = script[beat] ?? script[0]
 
   useEffect(() => {
     playingRef.current = playing
   }, [playing])
 
-  // Portals need a client; keeps the expanded player out of the page's stacking
-  // context so the navbar cannot paint over it.
+  useEffect(() => {
+    speedRef.current = speed
+  }, [speed])
+
+  useEffect(() => {
+    voiceRef.current = voice
+  }, [voice])
+
+  // Portals need a client; keeps the expanded player above the navigation.
   useEffect(() => setMounted(true), [])
 
   // A different mission selected: back to the poster.
@@ -139,7 +322,7 @@ export default function MissionFilm({
     setActive(false)
     setPlaying(false)
     setProgress(0)
-    setPhase(0)
+    setBeat(0)
     elapsedRef.current = 0
   }, [relic.id])
 
@@ -149,22 +332,36 @@ export default function MissionFilm({
     setPlaying(true)
   }, [autoPlayToken])
 
-  // Narration follows the film, and stops the moment it pauses or closes.
+  // Narration follows the current chapter and stops when the film pauses.
   useEffect(() => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return
     const synth = window.speechSynthesis
-    if (!active || !voice || !playing) {
-      synth.cancel()
-      return
-    }
     synth.cancel()
-    const utterance = new SpeechSynthesisUtterance(narration[phase])
-    utterance.rate = 0.94
-    utterance.pitch = 1
+    speechBusyRef.current = false
+    if (!active || !voice || !playing) return
+
+    const line = script[beat]?.narration
+    if (!line) return
+
+    const utterance = new SpeechSynthesisUtterance(line)
+    utterance.rate = 0.95
+    utterance.pitch = 1.02
     utterance.volume = 1
+    utterance.onend = () => {
+      speechBusyRef.current = false
+    }
+    utterance.onerror = () => {
+      speechBusyRef.current = false
+    }
+    speechBusyRef.current = true
+    speechStartedRef.current = Date.now()
     synth.speak(utterance)
-    return () => synth.cancel()
-  }, [phase, playing, voice, active, narration])
+
+    return () => {
+      synth.cancel()
+      speechBusyRef.current = false
+    }
+  }, [active, voice, playing, beat, script])
 
   useEffect(() => {
     return () => {
@@ -211,40 +408,127 @@ export default function MissionFilm({
       renderer.outputColorSpace = THREE.SRGBColorSpace
 
       const scene = new THREE.Scene()
-      const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 120)
-      const world = new THREE.Group()
-      scene.add(world)
+      const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 220)
+      camera.position.set(0, 1.4, 4)
 
-      // ---- body -------------------------------------------------------------
-      const loader = new THREE.TextureLoader()
-      const map = await new Promise<ThreeTypes.Texture | null>((resolve) => {
-        loader.load(BODY_TEXTURE[relic.planet], (texture) => resolve(texture), undefined, () => resolve(null))
-      })
+      const disposeList: { dispose: () => void }[] = []
+      function trackDispose<T extends { dispose: () => void }>(item: T): T {
+        disposeList.push(item)
+        return item
+      }
+
+      const loadTexture = (url: string) =>
+        new Promise<ThreeTypes.Texture | null>((resolve) => {
+          new THREE.TextureLoader().load(
+            url,
+            (texture) => {
+              texture.colorSpace = THREE.SRGBColorSpace
+              resolve(trackDispose(texture))
+            },
+            undefined,
+            () => resolve(null),
+          )
+        })
+
+      const [earthMap, bodyMap] = await Promise.all([
+        loadTexture(EARTH_TEXTURE),
+        loadTexture(BODY_TEXTURE[relic.planet]),
+      ])
       if (disposed) return
-      if (map) map.colorSpace = THREE.SRGBColorSpace
 
-      const bodyGeo = new THREE.SphereGeometry(1, 64, 64)
-      const bodyMat = new THREE.MeshStandardMaterial({
-        map: map ?? undefined,
-        color: map ? 0xffffff : BODY_TINT[relic.planet],
-        roughness: 0.96,
-        metalness: 0,
-      })
-      world.add(new THREE.Mesh(bodyGeo, bodyMat))
+      // ---- shared materials -------------------------------------------------
+      const metalMat = trackDispose(
+        new THREE.MeshStandardMaterial({ color: 0xdde5f3, roughness: 0.34, metalness: 0.65 }),
+      )
+      const goldMat = trackDispose(
+        new THREE.MeshStandardMaterial({ color: 0xd8a444, roughness: 0.42, metalness: 0.8 }),
+      )
+      const panelMat = trackDispose(
+        new THREE.MeshStandardMaterial({ color: 0x35558f, roughness: 0.25, metalness: 0.5 }),
+      )
+      const darkMat = trackDispose(
+        new THREE.MeshStandardMaterial({ color: 0x2b3450, roughness: 0.7, metalness: 0.2 }),
+      )
+      const hullMat = trackDispose(
+        new THREE.MeshStandardMaterial({ color: 0xc9d3e4, roughness: 0.5, metalness: 0.4 }),
+      )
+      const glowMat = trackDispose(
+        new THREE.MeshBasicMaterial({ color: 0x9ec8ff, transparent: true, opacity: 0.9 }),
+      )
+      const flameMat = trackDispose(
+        new THREE.MeshBasicMaterial({
+          color: 0xffb066,
+          transparent: true,
+          opacity: 0.85,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        }),
+      )
+      const dustMat = trackDispose(
+        new THREE.MeshBasicMaterial({ color: 0xd9c9b5, transparent: true, opacity: 0, depthWrite: false }),
+      )
 
-      const key = new THREE.DirectionalLight(0xfff4e8, 2.4)
-      key.position.set(2.6, 1.9, 2.4)
-      scene.add(key)
-      const rim = new THREE.DirectionalLight(0x83b7ff, 1.1)
-      rim.position.set(-2.6, -1.1, -1.9)
-      scene.add(rim)
-      scene.add(new THREE.AmbientLight(0x2a3352, 1.3))
+      // ---- vehicle model ----------------------------------------------------
+      const makeVehicle = () => {
+        const group = new THREE.Group()
+        const add = (
+          geometry: ThreeTypes.BufferGeometry,
+          material: ThreeTypes.Material,
+          x = 0,
+          y = 0,
+          z = 0,
+        ) => {
+          trackDispose(geometry)
+          const mesh = new THREE.Mesh(geometry, material)
+          mesh.position.set(x, y, z)
+          group.add(mesh)
+          return mesh
+        }
 
-      // ---- stars ------------------------------------------------------------
-      const starCount = 900
+        if (vehicle === 'rover') {
+          add(new THREE.BoxGeometry(0.1, 0.038, 0.062), goldMat)
+          add(new THREE.BoxGeometry(0.07, 0.006, 0.05), panelMat, 0, 0.03, 0)
+          add(new THREE.CylinderGeometry(0.005, 0.005, 0.06, 8), metalMat, 0, 0.05, -0.012)
+          add(new THREE.BoxGeometry(0.016, 0.012, 0.012), darkMat, 0, 0.082, -0.012)
+          for (const x of [-0.034, 0, 0.034]) {
+            for (const z of [-0.036, 0.036]) {
+              const wheel = add(new THREE.CylinderGeometry(0.018, 0.018, 0.012, 16), darkMat, x, -0.03, z)
+              wheel.rotation.z = Math.PI / 2
+            }
+          }
+        } else if (vehicle === 'crewed') {
+          add(new THREE.ConeGeometry(0.052, 0.075, 24), metalMat, 0, 0.02, 0)
+          add(new THREE.CylinderGeometry(0.05, 0.052, 0.03, 24), goldMat, 0, -0.035, 0)
+          add(new THREE.CylinderGeometry(0.012, 0.012, 0.02, 12), metalMat, 0, 0.065, 0)
+        } else if (vehicle === 'sample') {
+          add(new THREE.ConeGeometry(0.045, 0.045, 20), metalMat, 0, 0.01, 0)
+          add(new THREE.SphereGeometry(0.032, 20, 14), goldMat, 0, -0.026, 0)
+          add(new THREE.CylinderGeometry(0.004, 0.004, 0.03, 8), metalMat, 0, 0.045, 0)
+        } else if (vehicle === 'satellite') {
+          add(new THREE.BoxGeometry(0.05, 0.05, 0.05), metalMat)
+          add(new THREE.BoxGeometry(0.085, 0.004, 0.05), panelMat, -0.075, 0, 0)
+          add(new THREE.BoxGeometry(0.085, 0.004, 0.05), panelMat, 0.075, 0, 0)
+          add(new THREE.CylinderGeometry(0.015, 0.02, 0.012, 16), goldMat, 0, 0.036, 0)
+        } else {
+          add(new THREE.CylinderGeometry(0.045, 0.045, 0.05, 20), metalMat)
+          add(new THREE.CylinderGeometry(0.03, 0.045, 0.018, 20), goldMat, 0, -0.034, 0)
+          add(new THREE.CylinderGeometry(0.003, 0.003, 0.05, 8), metalMat, 0, 0.045, 0)
+          for (let i = 0; i < 4; i += 1) {
+            const angle = (i / 4) * Math.PI * 2 + Math.PI / 4
+            const leg = add(new THREE.CylinderGeometry(0.004, 0.004, 0.06, 6), metalMat)
+            leg.position.set(Math.cos(angle) * 0.032, -0.03, Math.sin(angle) * 0.032)
+            leg.rotation.z = Math.cos(angle) * 0.5
+            leg.rotation.x = Math.sin(angle) * 0.5
+          }
+        }
+        return group
+      }
+
+      // ---- stars (shared by every set) --------------------------------------
+      const starCount = 1100
       const starPositions = new Float32Array(starCount * 3)
       for (let i = 0; i < starCount; i += 1) {
-        const r = 16 + (i % 8) * 4
+        const r = 18 + (i % 9) * 6
         const u = Math.random() * 2 - 1
         const angle = Math.random() * Math.PI * 2
         const s = Math.sqrt(1 - u * u)
@@ -252,123 +536,350 @@ export default function MissionFilm({
         starPositions[i * 3 + 1] = r * u
         starPositions[i * 3 + 2] = r * s * Math.sin(angle)
       }
-      const starGeo = new THREE.BufferGeometry()
+      const starGeo = trackDispose(new THREE.BufferGeometry())
       starGeo.setAttribute('position', new THREE.BufferAttribute(starPositions, 3))
-      const starMat = new THREE.PointsMaterial({
-        color: 0xd6e6ff,
-        size: 0.11,
-        sizeAttenuation: true,
-        transparent: true,
-        opacity: 0.85,
-      })
+      const starMat = trackDispose(
+        new THREE.PointsMaterial({
+          color: 0xd6e6ff,
+          size: 0.13,
+          sizeAttenuation: true,
+          transparent: true,
+          opacity: 0.85,
+        }),
+      )
       scene.add(new THREE.Points(starGeo, starMat))
 
-      // ---- landing site -----------------------------------------------------
+      // ---- lighting ---------------------------------------------------------
+      const key = new THREE.DirectionalLight(0xfff4e8, 2.4)
+      key.position.set(3.2, 2.4, 3)
+      scene.add(key)
+      const rim = new THREE.DirectionalLight(0x83b7ff, 1.2)
+      rim.position.set(-3, -1.2, -2.4)
+      scene.add(rim)
+      scene.add(new THREE.AmbientLight(0x2a3352, 1.35))
+
+      // ---- set A: the machine on a turntable --------------------------------
+      const vehicleSet = new THREE.Group()
+      scene.add(vehicleSet)
+
+      const displayVehicle = makeVehicle()
+      displayVehicle.scale.setScalar(1.9)
+      vehicleSet.add(displayVehicle)
+
+      const turntable = new THREE.Mesh(
+        trackDispose(new THREE.RingGeometry(0.62, 0.66, 64)),
+        trackDispose(
+          new THREE.MeshBasicMaterial({
+            color: 0x83b7ff,
+            transparent: true,
+            opacity: 0.35,
+            side: THREE.DoubleSide,
+          }),
+        ),
+      )
+      turntable.rotation.x = -Math.PI / 2
+      turntable.position.y = -0.42
+      vehicleSet.add(turntable)
+
+      // Three pulsing pointers used during "How it works".
+      const pointers: ThreeTypes.Mesh[] = []
+      for (let i = 0; i < 3; i += 1) {
+        const pointer = new THREE.Mesh(trackDispose(new THREE.SphereGeometry(0.022, 12, 12)), glowMat)
+        pointer.visible = false
+        vehicleSet.add(pointer)
+        pointers.push(pointer)
+      }
+
+      // ---- set B: the launch pad --------------------------------------------
+      const padSet = new THREE.Group()
+      scene.add(padSet)
+
+      const earthSphere = new THREE.Mesh(
+        trackDispose(new THREE.SphereGeometry(18, 64, 48)),
+        trackDispose(
+          new THREE.MeshStandardMaterial({
+            map: earthMap ?? undefined,
+            color: earthMap ? 0xffffff : 0x2b4a7a,
+            roughness: 1,
+            metalness: 0,
+          }),
+        ),
+      )
+      earthSphere.position.y = -18
+      padSet.add(earthSphere)
+
+      const padBase = new THREE.Mesh(
+        trackDispose(new THREE.CylinderGeometry(1.5, 1.6, 0.14, 40)),
+        trackDispose(new THREE.MeshStandardMaterial({ color: 0x30384d, roughness: 0.9 })),
+      )
+      padBase.position.y = 0.07
+      padSet.add(padBase)
+
+      const tower = new THREE.Group()
+      const towerPost = new THREE.Mesh(trackDispose(new THREE.BoxGeometry(0.16, 3.2, 0.16)), darkMat)
+      towerPost.position.set(-1.05, 1.6, 0)
+      tower.add(towerPost)
+      for (const y of [1.1, 2.0, 2.9]) {
+        const arm = new THREE.Mesh(trackDispose(new THREE.BoxGeometry(0.55, 0.07, 0.07)), darkMat)
+        arm.position.set(-0.78, y, 0)
+        tower.add(arm)
+      }
+      padSet.add(tower)
+
+      // Rocket stack: booster (drops away), upper stage + payload (continues).
+      const rocket = new THREE.Group()
+      padSet.add(rocket)
+
+      const boosterGroup = new THREE.Group()
+      rocket.add(boosterGroup)
+
+      const booster = new THREE.Mesh(trackDispose(new THREE.CylinderGeometry(0.26, 0.31, 2.3, 28)), hullMat)
+      booster.position.y = 1.2
+      boosterGroup.add(booster)
+
+      const boosterFlame = new THREE.Mesh(trackDispose(new THREE.ConeGeometry(0.2, 1.2, 18)), flameMat)
+      boosterFlame.rotation.x = Math.PI
+      boosterFlame.position.y = -0.5
+      boosterGroup.add(boosterFlame)
+
+      const upperGroup = new THREE.Group()
+      rocket.add(upperGroup)
+
+      const interstage = new THREE.Mesh(trackDispose(new THREE.CylinderGeometry(0.25, 0.26, 0.22, 24)), darkMat)
+      interstage.position.y = 2.46
+      upperGroup.add(interstage)
+
+      const upperStage = new THREE.Mesh(trackDispose(new THREE.CylinderGeometry(0.19, 0.24, 0.85, 24)), hullMat)
+      upperStage.position.y = 3.0
+      upperGroup.add(upperStage)
+
+      const fairing = new THREE.Group()
+      fairing.position.y = 3.9
+      const fairingCone = new THREE.Mesh(trackDispose(new THREE.ConeGeometry(0.28, 0.8, 24, 1, true)), metalMat)
+      fairing.add(fairingCone)
+      upperGroup.add(fairing)
+
+      const payload = makeVehicle()
+      payload.position.y = 3.55
+      payload.scale.setScalar(1.1)
+      payload.visible = false
+      upperGroup.add(payload)
+
+      const upperFlame = new THREE.Mesh(trackDispose(new THREE.ConeGeometry(0.15, 0.8, 16)), flameMat)
+      upperFlame.rotation.x = Math.PI
+      upperFlame.position.y = 2.0
+      upperFlame.visible = false
+      upperGroup.add(upperFlame)
+
+      // Ground smoke puffs.
+      const puffs: { mesh: ThreeTypes.Mesh; seed: number }[] = []
+      for (let i = 0; i < 12; i += 1) {
+        const puff = new THREE.Mesh(trackDispose(new THREE.SphereGeometry(0.28, 12, 12)), dustMat.clone())
+        trackDispose(puff.material as ThreeTypes.Material)
+        const angle = (i / 12) * Math.PI * 2
+        puff.position.set(Math.cos(angle) * 0.9, 0.24, Math.sin(angle) * 0.9)
+        puff.scale.setScalar(0.25)
+        padSet.add(puff)
+        puffs.push({ mesh: puff, seed: i * 0.37 })
+      }
+
+      // ---- set C: the voyage ------------------------------------------------
+      const spaceSet = new THREE.Group()
+      scene.add(spaceSet)
+
+      const earthFar = new THREE.Mesh(
+        trackDispose(new THREE.SphereGeometry(0.95, 48, 40)),
+        trackDispose(
+          new THREE.MeshStandardMaterial({
+            map: earthMap ?? undefined,
+            color: earthMap ? 0xffffff : 0x2b4a7a,
+            roughness: 1,
+          }),
+        ),
+      )
+      earthFar.position.set(-2.9, 0.5, -2.4)
+      spaceSet.add(earthFar)
+
+      const targetFar = new THREE.Mesh(
+        trackDispose(new THREE.SphereGeometry(1.35, 56, 44)),
+        trackDispose(
+          new THREE.MeshStandardMaterial({
+            map: bodyMap ?? undefined,
+            color: bodyMap ? 0xffffff : BODY_TINT[relic.planet],
+            roughness: 1,
+          }),
+        ),
+      )
+      targetFar.position.set(2.8, 0.1, 2.6)
+      spaceSet.add(targetFar)
+
+      const cruiseCraft = makeVehicle()
+      cruiseCraft.scale.setScalar(2.2)
+      spaceSet.add(cruiseCraft)
+
+      const cruiseFlame = new THREE.Mesh(trackDispose(new THREE.ConeGeometry(0.14, 0.7, 16)), flameMat)
+      cruiseFlame.rotation.x = Math.PI / 2
+      cruiseFlame.position.set(0.42, 0, 0)
+      cruiseCraft.add(cruiseFlame)
+
+      // ---- set D: the landing site -----------------------------------------
+      const targetSet = new THREE.Group()
+      scene.add(targetSet)
+
+      const body = new THREE.Mesh(
+        trackDispose(new THREE.SphereGeometry(1, 64, 64)),
+        trackDispose(
+          new THREE.MeshStandardMaterial({
+            map: bodyMap ?? undefined,
+            color: bodyMap ? 0xffffff : BODY_TINT[relic.planet],
+            roughness: 0.96,
+            metalness: 0,
+          }),
+        ),
+      )
+      targetSet.add(body)
+
       const site = surfacePoint(relic.latitude, relic.longitude, 1.004)
       const markerPos = new THREE.Vector3(site.x, site.y, site.z)
-      const baseYaw = -Math.atan2(markerPos.x, markerPos.z)
-      world.rotation.y = baseYaw
+      const siteNormal = markerPos.clone().normalize()
+      const siteSide = new THREE.Vector3(0, 1, 0).cross(siteNormal)
+      if (siteSide.lengthSq() < 0.001) siteSide.set(1, 0, 0)
+      siteSide.normalize()
+      const siteUp = siteNormal.clone().cross(siteSide).normalize()
 
-      const markerGeo = new THREE.SphereGeometry(0.028, 20, 20)
-      const markerMat = new THREE.MeshBasicMaterial({ color: 0x9ec8ff })
-      const marker = new THREE.Mesh(markerGeo, markerMat)
+      const marker = new THREE.Mesh(trackDispose(new THREE.SphereGeometry(0.026, 18, 18)), glowMat)
       marker.position.copy(markerPos)
-      world.add(marker)
+      targetSet.add(marker)
 
-      const ringGeo = new THREE.RingGeometry(0.046, 0.062, 56)
-      const ringMat = new THREE.MeshBasicMaterial({
-        color: 0x9ec8ff,
-        transparent: true,
-        opacity: 0,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-      })
-      const ring = new THREE.Mesh(ringGeo, ringMat)
-      ring.position.copy(markerPos)
-      ring.lookAt(markerPos.clone().multiplyScalar(4))
-      world.add(ring)
+      const siteRing = new THREE.Mesh(
+        trackDispose(new THREE.RingGeometry(0.042, 0.058, 56)),
+        trackDispose(
+          new THREE.MeshBasicMaterial({
+            color: 0x9ec8ff,
+            transparent: true,
+            opacity: 0,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          }),
+        ),
+      )
+      siteRing.position.copy(markerPos)
+      siteRing.lookAt(markerPos.clone().multiplyScalar(4))
+      targetSet.add(siteRing)
 
-      // ---- descent track ----------------------------------------------------
-      const start = new THREE.Vector3(0.85, 0.95, 3.15)
-      const control = markerPos.clone().normalize().multiplyScalar(2.0).add(new THREE.Vector3(0, 0.55, 0))
-      const curve = new THREE.QuadraticBezierCurve3(start, control, markerPos.clone().multiplyScalar(1.02))
+      // Descent path: high above the site, down onto it.
+      const descentStart = markerPos
+        .clone()
+        .addScaledVector(siteUp, 0.85)
+        .addScaledVector(siteSide, 0.35)
+        .addScaledVector(siteNormal, 0.55)
+      const descentControl = markerPos
+        .clone()
+        .addScaledVector(siteUp, 0.4)
+        .addScaledVector(siteNormal, 0.34)
+      const descentCurve = new THREE.QuadraticBezierCurve3(descentStart, descentControl, markerPos.clone())
+      const trailGeo = trackDispose(new THREE.BufferGeometry().setFromPoints(descentCurve.getPoints(80)))
+      const trailMat = trackDispose(
+        new THREE.LineBasicMaterial({ color: 0x9fc4ff, transparent: true, opacity: 0 }),
+      )
+      targetSet.add(new THREE.Line(trailGeo, trailMat))
 
-      const trailGeo = new THREE.BufferGeometry().setFromPoints(curve.getPoints(72))
-      const trailMat = new THREE.LineBasicMaterial({ color: 0x9fc4ff, transparent: true, opacity: 0 })
-      world.add(new THREE.Line(trailGeo, trailMat))
+      const descentVehicle = makeVehicle()
+      descentVehicle.scale.setScalar(1.05)
+      descentVehicle.visible = false
+      targetSet.add(descentVehicle)
 
-      // ---- vehicle: the hardware class recorded for this mission ------------
-      const vehicleGroup = new THREE.Group()
-      const metalMat = new THREE.MeshStandardMaterial({ color: 0xdde5f3, roughness: 0.34, metalness: 0.65 })
-      const goldMat = new THREE.MeshStandardMaterial({ color: 0xd8a444, roughness: 0.42, metalness: 0.8 })
-      const panelMat = new THREE.MeshStandardMaterial({ color: 0x35558f, roughness: 0.25, metalness: 0.5 })
-      const darkMat = new THREE.MeshStandardMaterial({ color: 0x2b3450, roughness: 0.7, metalness: 0.2 })
-      const parts: ThreeTypes.BufferGeometry[] = []
+      const landedVehicle = makeVehicle()
+      landedVehicle.scale.setScalar(0.7)
+      landedVehicle.visible = false
+      landedVehicle.position.copy(markerPos)
+      landedVehicle.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), siteNormal)
+      targetSet.add(landedVehicle)
 
-      const add = (geometry: ThreeTypes.BufferGeometry, material: ThreeTypes.Material, x = 0, y = 0, z = 0) => {
-        parts.push(geometry)
-        const mesh = new THREE.Mesh(geometry, material)
-        mesh.position.set(x, y, z)
-        vehicleGroup.add(mesh)
-        return mesh
-      }
+      const roverClone = makeVehicle()
+      roverClone.scale.setScalar(0.55)
+      roverClone.visible = false
+      targetSet.add(roverClone)
 
-      if (vehicle === 'rover') {
-        add(new THREE.BoxGeometry(0.1, 0.038, 0.062), goldMat)
-        add(new THREE.BoxGeometry(0.07, 0.006, 0.05), panelMat, 0, 0.03, 0)
-        add(new THREE.CylinderGeometry(0.005, 0.005, 0.06, 8), metalMat, 0, 0.05, -0.012)
-        add(new THREE.BoxGeometry(0.016, 0.012, 0.012), darkMat, 0, 0.082, -0.012)
-        for (const x of [-0.034, 0, 0.034]) {
-          for (const z of [-0.036, 0.036]) {
-            const wheel = add(new THREE.CylinderGeometry(0.018, 0.018, 0.012, 16), darkMat, x, -0.03, z)
-            wheel.rotation.z = Math.PI / 2
-          }
-        }
-      } else if (vehicle === 'crewed') {
-        add(new THREE.ConeGeometry(0.052, 0.075, 24), metalMat, 0, 0.02, 0)
-        add(new THREE.CylinderGeometry(0.05, 0.052, 0.03, 24), goldMat, 0, -0.035, 0)
-        add(new THREE.CylinderGeometry(0.012, 0.012, 0.02, 12), metalMat, 0, 0.065, 0)
-      } else if (vehicle === 'sample') {
-        add(new THREE.ConeGeometry(0.045, 0.045, 20), metalMat, 0, 0.01, 0)
-        add(new THREE.SphereGeometry(0.032, 20, 14), goldMat, 0, -0.026, 0)
-        add(new THREE.CylinderGeometry(0.004, 0.004, 0.03, 8), metalMat, 0, 0.045, 0)
-      } else if (vehicle === 'satellite') {
-        add(new THREE.BoxGeometry(0.05, 0.05, 0.05), metalMat)
-        add(new THREE.BoxGeometry(0.085, 0.004, 0.05), panelMat, -0.075, 0, 0)
-        add(new THREE.BoxGeometry(0.085, 0.004, 0.05), panelMat, 0.075, 0, 0)
-        add(new THREE.CylinderGeometry(0.015, 0.02, 0.012, 16), goldMat, 0, 0.036, 0)
-      } else {
-        add(new THREE.CylinderGeometry(0.045, 0.045, 0.05, 20), metalMat)
-        add(new THREE.CylinderGeometry(0.03, 0.045, 0.018, 20), goldMat, 0, -0.034, 0)
-        add(new THREE.CylinderGeometry(0.003, 0.003, 0.05, 8), metalMat, 0, 0.045, 0)
-        for (let i = 0; i < 4; i += 1) {
-          const angle = (i / 4) * Math.PI * 2 + Math.PI / 4
-          const legGeo = new THREE.CylinderGeometry(0.004, 0.004, 0.06, 6)
-          parts.push(legGeo)
-          const leg = new THREE.Mesh(legGeo, metalMat)
-          leg.position.set(Math.cos(angle) * 0.032, -0.03, Math.sin(angle) * 0.032)
-          leg.rotation.z = Math.cos(angle) * 0.5
-          leg.rotation.x = Math.sin(angle) * 0.5
-          vehicleGroup.add(leg)
-        }
-      }
-
-      const vehiclePivot = new THREE.Group()
-      vehiclePivot.add(vehicleGroup)
-      vehiclePivot.visible = false
-      world.add(vehiclePivot)
-
-      // ---- framing ----------------------------------------------------------
-      const orbit = { theta: 0, phi: 0.14, radius: 4.6 }
-      const place = () => {
-        const cosPhi = Math.cos(orbit.phi)
-        camera.position.set(
-          Math.sin(orbit.theta) * cosPhi * orbit.radius,
-          Math.sin(orbit.phi) * orbit.radius,
-          Math.cos(orbit.theta) * cosPhi * orbit.radius,
+      // Surface details used by the "After landing" chapter.
+      const footprints: ThreeTypes.Mesh[] = []
+      for (let i = 0; i < 9; i += 1) {
+        const print = new THREE.Mesh(
+          trackDispose(new THREE.CircleGeometry(0.012, 10)),
+          trackDispose(
+            new THREE.MeshBasicMaterial({ color: 0x6a7386, transparent: true, opacity: 0.75, side: THREE.DoubleSide }),
+          ),
         )
-        camera.lookAt(0, 0, 0)
+        print.position
+          .copy(markerPos)
+          .addScaledVector(siteSide, 0.05 + i * 0.032)
+          .addScaledVector(siteUp, 0.02 * Math.sin(i * 1.3))
+          .addScaledVector(siteNormal, 0.002)
+        print.lookAt(print.position.clone().multiplyScalar(3))
+        print.visible = false
+        targetSet.add(print)
+        footprints.push(print)
       }
+
+      const antenna = new THREE.Mesh(
+        trackDispose(new THREE.ConeGeometry(0.045, 0.03, 18, 1, true)),
+        metalMat,
+      )
+      antenna.position.copy(markerPos).addScaledVector(siteNormal, 0.06)
+      antenna.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), siteNormal)
+      antenna.visible = false
+      targetSet.add(antenna)
+
+      const pingRings: ThreeTypes.Mesh[] = []
+      for (let i = 0; i < 2; i += 1) {
+        const ring = new THREE.Mesh(
+          trackDispose(new THREE.RingGeometry(0.04, 0.052, 40)),
+          trackDispose(
+            new THREE.MeshBasicMaterial({
+              color: 0x9ef0c8,
+              transparent: true,
+              opacity: 0,
+              side: THREE.DoubleSide,
+              depthWrite: false,
+            }),
+          ),
+        )
+        ring.position.copy(markerPos).addScaledVector(siteNormal, 0.03)
+        ring.lookAt(markerPos.clone().multiplyScalar(4))
+        targetSet.add(ring)
+        pingRings.push(ring)
+      }
+
+      const ascentCapsule = new THREE.Mesh(
+        trackDispose(new THREE.ConeGeometry(0.03, 0.06, 18)),
+        goldMat,
+      )
+      ascentCapsule.visible = false
+      targetSet.add(ascentCapsule)
+
+      // ---- interaction: drag to look around --------------------------------
+      let dragYaw = 0
+      let dragging = false
+      let lastX = 0
+      const onDown = (event: PointerEvent) => {
+        dragging = true
+        lastX = event.clientX
+        canvas.setPointerCapture?.(event.pointerId)
+      }
+      const onMove = (event: PointerEvent) => {
+        if (!dragging) return
+        dragYaw += (event.clientX - lastX) * 0.007
+        dragYaw = Math.max(-1.4, Math.min(1.4, dragYaw))
+        lastX = event.clientX
+      }
+      const onUp = (event: PointerEvent) => {
+        dragging = false
+        canvas.releasePointerCapture?.(event.pointerId)
+      }
+      canvas.addEventListener('pointerdown', onDown)
+      canvas.addEventListener('pointermove', onMove)
+      canvas.addEventListener('pointerup', onUp)
+      canvas.addEventListener('pointercancel', onUp)
 
       const resize = () => {
         const w = stage.clientWidth
@@ -382,36 +893,31 @@ export default function MissionFilm({
       observer.observe(stage)
       resize()
 
-      // ---- interaction: drag to look around ---------------------------------
-      let dragging = false
-      let lastX = 0
-      let lastY = 0
-      const onDown = (event: PointerEvent) => {
-        dragging = true
-        lastX = event.clientX
-        lastY = event.clientY
-        canvas.setPointerCapture?.(event.pointerId)
-      }
-      const onMove = (event: PointerEvent) => {
-        if (!dragging) return
-        orbit.theta -= (event.clientX - lastX) * 0.006
-        orbit.phi = Math.max(-0.85, Math.min(1.05, orbit.phi + (event.clientY - lastY) * 0.004))
-        lastX = event.clientX
-        lastY = event.clientY
-      }
-      const onUp = (event: PointerEvent) => {
-        dragging = false
-        canvas.releasePointerCapture?.(event.pointerId)
-      }
-      canvas.addEventListener('pointerdown', onDown)
-      canvas.addEventListener('pointermove', onMove)
-      canvas.addEventListener('pointerup', onUp)
-      canvas.addEventListener('pointercancel', onUp)
-
       // ---- loop -------------------------------------------------------------
+      const desiredPos = new THREE.Vector3()
+      const desiredLook = new THREE.Vector3()
+      const lookAt = new THREE.Vector3(0, 0, 0)
+      const scratch = new THREE.Vector3()
+      let first = true
       let last = performance.now()
       let lastPct = -1
-      let lastPhase = -1
+      let lastBeat = -1
+      let lastShot = ''
+
+      const setCamera = (px: number, py: number, pz: number, lx: number, ly: number, lz: number, dt: number) => {
+        desiredPos.set(px, py, pz)
+        desiredLook.set(lx, ly, lz)
+        if (first) {
+          camera.position.copy(desiredPos)
+          lookAt.copy(desiredLook)
+          first = false
+        } else {
+          const k = 1 - Math.exp(-dt * 2.6)
+          camera.position.lerp(desiredPos, k)
+          lookAt.lerp(desiredLook, k)
+        }
+        camera.lookAt(lookAt)
+      }
 
       const loop = () => {
         if (disposed) return
@@ -419,52 +925,273 @@ export default function MissionFilm({
         const dt = Math.min(0.05, (now - last) / 1000)
         last = now
 
+        const index = beatIndexAt(elapsedRef.current)
+        const beatDef = BEATS[index]
+        const beatEnd = STARTS[index] + beatDef.seconds
+        const isLast = index === BEATS.length - 1
+
         if (playingRef.current) {
-          elapsedRef.current = Math.min(DURATION, elapsedRef.current + dt)
+          // Hold the last shot of a chapter until its narration finishes.
+          const speaking = speechBusyRef.current && voiceRef.current && !isLast
+          const recent = Date.now() - speechStartedRef.current < (beatDef.seconds + 12) * 1000
+          let next = elapsedRef.current + dt * speedRef.current
+          if (speaking && recent) next = Math.min(next, beatEnd - 0.05)
+          elapsedRef.current = Math.min(DURATION, next)
           if (elapsedRef.current >= DURATION) {
             playingRef.current = false
             setPlaying(false)
           }
         }
+
         const t = elapsedRef.current
+        const i = beatIndexAt(t)
+        const b = BEATS[i]
+        const p = Math.max(0, Math.min(1, (t - STARTS[i]) / b.seconds))
 
-        const targetRadius = t < T_INBOUND ? 4.6 - 1.05 * (t / T_INBOUND) : t < T_IMPACT ? 3.55 : 2.95
-        orbit.radius += (targetRadius - orbit.radius) * Math.min(1, dt * 2.4)
-        place()
-
-        world.rotation.y = baseYaw + Math.sin(t * 0.16) * 0.12
-
-        const inbound = Math.max(0, Math.min(1, (t - T_INBOUND) / (T_IMPACT - T_INBOUND)))
-        trailMat.opacity = inbound > 0 ? 0.45 * (1 - inbound * 0.3) : 0
-        vehiclePivot.visible = inbound > 0 && inbound < 1
-        if (vehiclePivot.visible) {
-          const e = easeInOut(inbound)
-          const point = curve.getPoint(e)
-          const tangent = curve.getTangent(e).normalize()
-          vehiclePivot.position.copy(point)
-          vehiclePivot.lookAt(point.clone().add(tangent))
-          vehicleGroup.rotation.y = t * 0.6
+        // A new shot is a cut, not a glide: snap the camera so every chapter
+        // opens on its own framing (and so a throttled tab cannot leave the
+        // camera stranded between two sets).
+        if (b.shot !== lastShot) {
+          lastShot = b.shot
+          first = true
         }
 
-        const sinceImpact = t - T_IMPACT
-        if (sinceImpact > 0) {
-          const cycle = (sinceImpact % 1.9) / 1.9
-          ring.scale.setScalar(1 + cycle * 5.5)
-          ringMat.opacity = 0.8 * (1 - cycle)
-        } else {
-          ringMat.opacity = 0
+        // Only the active set is visible.
+        vehicleSet.visible = b.shot === 'vehicle' || b.shot === 'closeup'
+        padSet.visible = b.shot === 'pad' || b.shot === 'ascent' || b.shot === 'staging'
+        spaceSet.visible = b.shot === 'cruise'
+        targetSet.visible =
+          b.shot === 'descent' || b.shot === 'touchdown' || b.shot === 'surface' || b.shot === 'legacy'
+
+        // ---- set A: meet / how it works --------------------------------------
+        if (vehicleSet.visible) {
+          vehicleSet.rotation.y = dragYaw + t * (b.shot === 'closeup' ? 0.18 : 0.32)
+          displayVehicle.rotation.x = 0
+          displayVehicle.position.y = Math.sin(t * 1.1) * 0.02
+
+          pointers.forEach((pointer, idx) => {
+            const angle = t * 0.6 + (idx / 3) * Math.PI * 2
+            const radius = 0.55
+            pointer.position.set(
+              Math.cos(angle) * radius,
+              idx === 0 ? 0.16 : idx === 1 ? -0.18 : 0.32,
+              Math.sin(angle) * radius * 0.6,
+            )
+            pointer.visible = b.shot === 'closeup'
+            ;(pointer.material as ThreeTypes.MeshBasicMaterial).opacity = 0.45 + Math.sin(t * 4 + idx) * 0.35
+          })
+
+          const dist = b.shot === 'closeup' ? 2.05 - 0.25 * Math.sin(p * Math.PI) : 2.75 - 0.35 * p
+          setCamera(
+            Math.sin(t * 0.25 + dragYaw) * dist * 0.55,
+            0.62 + Math.sin(t * 0.4) * 0.12 + (b.shot === 'closeup' ? 0.1 * Math.sin(p * 6) : 0),
+            dist,
+            0,
+            0,
+            0,
+            dt,
+          )
         }
-        marker.scale.setScalar(1 + Math.sin(t * 6) * 0.12)
+
+        // ---- set B: pad / liftoff / staging ----------------------------------
+        if (padSet.visible) {
+          const flameScale = b.shot === 'pad' ? 0.45 + Math.sin(t * 9) * 0.12 : 1.15 + Math.sin(t * 16) * 0.2
+          boosterFlame.scale.set(flameScale, 1 + (b.shot === 'pad' ? 0 : 0.8), flameScale)
+          ;(boosterFlame.material as ThreeTypes.MeshBasicMaterial).opacity = b.shot === 'pad' ? 0.4 : 0.9
+          boosterFlame.visible = b.shot !== 'staging' || p < 0.25
+
+          upperFlame.visible = b.shot === 'staging' && p > 0.3
+
+          if (b.shot === 'pad') {
+            rocket.position.y = 0
+            boosterGroup.position.set(0, 0, 0)
+            boosterGroup.rotation.set(0, 0, 0)
+            boosterGroup.visible = true
+            fairing.visible = true
+            fairing.scale.setScalar(1)
+            payload.visible = false
+            upperFlame.visible = false
+
+            const drift = t * 0.05
+            setCamera(4.3 + Math.sin(drift) * 0.4, 2.3, 5.4 + Math.cos(drift) * 0.3, 0, 2.1, 0, dt)
+
+            puffs.forEach(({ mesh, seed }) => {
+              const life = (t * 0.35 + seed) % 1
+              mesh.scale.setScalar(0.2 + life * 0.55)
+              ;(mesh.material as ThreeTypes.MeshBasicMaterial).opacity = 0.16 * (1 - life)
+              mesh.position.y = 0.2 + life * 0.3
+            })
+          } else {
+            const climb = b.shot === 'ascent' ? easeInOut(p) * 24 : 24 + p * 8
+            rocket.position.y = climb
+            rocket.rotation.y = b.shot === 'ascent' ? p * 0.35 : 0.6
+
+            if (b.shot === 'staging') {
+              const sep = smoothstep(0.1, 0.7, p)
+              boosterGroup.position.set(sep * 1.6, -sep * 4.5, sep * 0.4)
+              boosterGroup.rotation.set(sep * 0.9, sep * 0.5, sep * 1.4)
+              boosterGroup.visible = sep < 0.96
+              fairing.scale.setScalar(Math.max(0.001, 1 - sep * 1.4))
+              fairing.visible = sep < 0.72
+              payload.visible = sep > 0.35
+              payload.rotation.y = t * 0.8
+            } else {
+              boosterGroup.visible = true
+              fairing.visible = true
+              fairing.scale.setScalar(1)
+              payload.visible = false
+            }
+
+            const side = b.shot === 'ascent' ? 4.2 : 5.4
+            setCamera(
+              rocket.position.x + side,
+              rocket.position.y + 1.9,
+              rocket.position.z + 5.4,
+              rocket.position.x,
+              rocket.position.y + 1.5,
+              rocket.position.z,
+              dt,
+            )
+
+            puffs.forEach(({ mesh, seed }) => {
+              const life = (p + seed * 0.2) % 1
+              mesh.scale.setScalar(0.4 + life * 1.6)
+              ;(mesh.material as ThreeTypes.MeshBasicMaterial).opacity = 0.3 * (1 - life)
+            })
+          }
+        }
+
+        // ---- set C: the voyage ----------------------------------------------
+        if (spaceSet.visible) {
+          earthFar.rotation.y = t * 0.08
+          targetFar.rotation.y = t * 0.05
+          targetFar.scale.setScalar(0.82 + p * 0.22)
+          cruiseCraft.position.set(
+            Math.sin(t * 0.3) * 0.12 - 0.3,
+            0.05 + Math.sin(t * 0.6) * 0.03,
+            -0.2 + p * 0.4,
+          )
+          cruiseCraft.rotation.y = Math.PI / 2 + dragYaw * 0.5
+          setCamera(
+            Math.sin(t * 0.16) * 0.7,
+            0.9 + Math.sin(t * 0.24) * 0.12,
+            5.6,
+            0.5,
+            0.05,
+            1.4,
+            dt,
+          )
+        }
+
+        // ---- set D: landing site ---------------------------------------------
+        if (targetSet.visible) {
+          targetSet.rotation.y = dragYaw * 0.5
+          body.rotation.y = b.shot === 'legacy' ? t * 0.06 : 0
+
+          marker.scale.setScalar(1 + Math.sin(t * 5) * 0.15)
+
+          const camDist =
+            b.shot === 'descent' ? 2.75 : b.shot === 'touchdown' ? 1.85 : b.shot === 'surface' ? 2.7 : 4.1
+          scratch.copy(siteNormal).multiplyScalar(camDist)
+          scratch.addScaledVector(siteSide, b.shot === 'legacy' ? 0.5 : 0.75)
+          scratch.addScaledVector(siteUp, b.shot === 'legacy' ? 0.7 : 0.35)
+
+          setCamera(
+            scratch.x,
+            scratch.y,
+            scratch.z,
+            markerPos.x * 1.02,
+            markerPos.y * 1.02,
+            markerPos.z * 1.02,
+            dt,
+          )
+
+          // descent + touchdown
+          trailMat.opacity = b.shot === 'descent' ? 0.55 : b.shot === 'touchdown' ? 0.22 : 0
+          if (b.shot === 'descent') {
+            descentVehicle.visible = true
+            const e = easeInOut(p)
+            const point = descentCurve.getPoint(e)
+            descentVehicle.position.copy(point)
+            descentVehicle.lookAt(markerPos)
+            descentVehicle.rotation.y += t * 0.5
+            landedVehicle.visible = false
+          } else if (b.shot === 'touchdown') {
+            descentVehicle.visible = p < 0.45
+            if (descentVehicle.visible) descentVehicle.position.copy(markerPos).addScaledVector(siteNormal, 0)
+            landedVehicle.visible = p >= 0.45
+            const cycle = (p % 0.5) / 0.5
+            siteRing.scale.setScalar(1 + cycle * 5.5)
+            ;(siteRing.material as ThreeTypes.MeshBasicMaterial).opacity = 0.85 * (1 - cycle)
+          } else {
+            descentVehicle.visible = false
+            ;(siteRing.material as ThreeTypes.MeshBasicMaterial).opacity = 0
+          }
+
+          // after landing: the class's own post-touchdown story
+          const surfaceActive = b.shot === 'surface' || b.shot === 'legacy'
+          roverClone.visible = false
+          antenna.visible = false
+          ascentCapsule.visible = false
+          footprints.forEach((print) => {
+            print.visible = false
+          })
+          pingRings.forEach((ring) => {
+            ;(ring.material as ThreeTypes.MeshBasicMaterial).opacity = 0
+          })
+
+          if (surfaceActive) {
+            landedVehicle.visible = true
+
+            if (vehicle === 'rover') {
+              roverClone.visible = true
+              const along = Math.min(1, p * 1.1)
+              const heading = markerPos
+                .clone()
+                .addScaledVector(siteSide, 0.08 + along * 0.26)
+                .normalize()
+                .multiplyScalar(1.004)
+              roverClone.position.copy(heading)
+              roverClone.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), siteNormal)
+              roverClone.rotateY(-Math.PI / 2)
+              roverClone.position.addScaledVector(siteNormal, 0.012)
+            } else if (vehicle === 'crewed') {
+              footprints.forEach((print, idx) => {
+                print.visible = p > (idx / footprints.length) * 0.75
+              })
+            } else if (vehicle === 'sample') {
+              antenna.visible = true
+              if (p > 0.45) {
+                ascentCapsule.visible = true
+                const rise = (p - 0.45) / 0.55
+                ascentCapsule.position
+                  .copy(markerPos)
+                  .addScaledVector(siteNormal, 0.05 + rise * 0.5)
+                  .addScaledVector(siteUp, rise * 0.12)
+              }
+            } else if (vehicle === 'lander') {
+              antenna.visible = true
+              pingRings.forEach((ring, idx) => {
+                const cycle = (p * 0.9 + idx * 0.5) % 1
+                ring.scale.setScalar(1 + cycle * 4)
+                ;(ring.material as ThreeTypes.MeshBasicMaterial).opacity = 0.55 * (1 - cycle)
+              })
+            } else {
+              antenna.visible = true
+            }
+          } else if (b.shot === 'touchdown' || b.shot === 'descent') {
+            landedVehicle.visible = b.shot === 'touchdown' && p >= 0.45
+          }
+        }
 
         const pct = Math.round((t / DURATION) * 100)
         if (pct !== lastPct) {
           lastPct = pct
           setProgress(pct)
         }
-        const nextPhase = t < T_INBOUND ? 0 : t < T_IMPACT ? 1 : t < T_REVEAL ? 2 : 3
-        if (nextPhase !== lastPhase) {
-          lastPhase = nextPhase
-          setPhase(nextPhase)
+        if (i !== lastBeat) {
+          lastBeat = i
+          setBeat(i)
         }
 
         renderer.render(scene, camera)
@@ -478,22 +1205,7 @@ export default function MissionFilm({
         canvas.removeEventListener('pointermove', onMove)
         canvas.removeEventListener('pointerup', onUp)
         canvas.removeEventListener('pointercancel', onUp)
-        starGeo.dispose()
-        starMat.dispose()
-        bodyGeo.dispose()
-        bodyMat.dispose()
-        map?.dispose()
-        markerGeo.dispose()
-        markerMat.dispose()
-        ringGeo.dispose()
-        ringMat.dispose()
-        trailGeo.dispose()
-        trailMat.dispose()
-        for (const geometry of parts) geometry.dispose()
-        metalMat.dispose()
-        goldMat.dispose()
-        panelMat.dispose()
-        darkMat.dispose()
+        for (const item of disposeList) item.dispose()
         renderer.dispose()
       }
     }
@@ -507,7 +1219,15 @@ export default function MissionFilm({
       cancelAnimationFrame(raf)
       teardown?.()
     }
-  }, [active, relic.id, relic.planet, relic.latitude, relic.longitude, vehicle, expanded])
+  }, [
+    active,
+    relic.id,
+    relic.planet,
+    relic.latitude,
+    relic.longitude,
+    vehicle,
+    expanded,
+  ])
 
   const toggle = useCallback(() => {
     if (!active) {
@@ -521,8 +1241,32 @@ export default function MissionFilm({
   const replay = useCallback(() => {
     elapsedRef.current = 0
     setProgress(0)
+    setBeat(0)
     setActive(true)
     setPlaying(true)
+  }, [])
+
+  const seekTo = useCallback(
+    (index: number) => {
+      const safe = Math.max(0, Math.min(BEATS.length - 1, index))
+      elapsedRef.current = STARTS[safe] + 0.001
+      setBeat(safe)
+      setProgress(Math.round((elapsedRef.current / DURATION) * 100))
+      setActive(true)
+      setPlaying(true)
+    },
+    [],
+  )
+
+  const stepChapter = useCallback(
+    (delta: number) => {
+      seekTo(beatIndexAt(elapsedRef.current) + delta)
+    },
+    [seekTo],
+  )
+
+  const cycleSpeed = useCallback(() => {
+    setSpeed((value) => (value === 1 ? 1.25 : value === 1.25 ? 1.5 : value === 1.5 ? 0.75 : 1))
   }, [])
 
   const card = (
@@ -536,13 +1280,18 @@ export default function MissionFilm({
       <div className="flex items-center justify-between gap-2 px-1 sm:px-0">
         <div className="flex items-center gap-2">
           <p className="font-display text-[9px] uppercase tracking-[0.24em] text-electric">Mission film</p>
+          <span className="font-mono text-[9px] uppercase tracking-[0.16em] text-moon/45">
+            {beat + 1}/{BEATS.length}
+          </span>
           {expanded && (
-            <span className="font-display text-[9px] uppercase tracking-[0.18em] text-moon/60">{relic.name}</span>
+            <span className="hidden font-display text-[9px] uppercase tracking-[0.18em] text-moon/60 sm:inline">
+              {relic.name}
+            </span>
           )}
         </div>
 
         <div className="flex items-center gap-1.5">
-          <p className="mr-1 font-mono text-[9px] uppercase tracking-[0.16em] text-moon/45">
+          <p className="mr-1 hidden font-mono text-[9px] uppercase tracking-[0.16em] text-moon/45 sm:block">
             {BODY_LABEL[relic.planet]} · {vehicleName}
           </p>
           <button
@@ -590,7 +1339,21 @@ export default function MissionFilm({
 
       <div
         ref={stageRef}
-        className={`relative w-full overflow-hidden bg-[#05060f] ${
+        tabIndex={active ? 0 : -1}
+        onKeyDown={(event) => {
+          if (event.key === 'ArrowRight') {
+            event.preventDefault()
+            stepChapter(1)
+          } else if (event.key === 'ArrowLeft') {
+            event.preventDefault()
+            stepChapter(-1)
+          } else if (event.key === ' ') {
+            event.preventDefault()
+            toggle()
+          }
+        }}
+        aria-label="Mission film scene. Arrow keys change chapter."
+        className={`relative w-full overflow-hidden bg-[#05060f] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric/60 ${
           expanded ? 'min-h-0 flex-1 rounded-xl' : 'mt-2 aspect-[16/9]'
         }`}
       >
@@ -610,7 +1373,7 @@ export default function MissionFilm({
               Play film
             </button>
             <p className="font-mono text-[9px] uppercase tracking-[0.14em] text-moon/40">
-              ≈ {DURATION} s · narrated · plays here
+              {BEATS.length} chapters · ≈ {DURATION} s · narrated · plays here
             </p>
           </div>
         )}
@@ -618,9 +1381,9 @@ export default function MissionFilm({
         {active && !failed && (
           <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-3 bg-gradient-to-b from-void/85 to-transparent p-2.5">
             <span className="font-display text-[9px] uppercase tracking-[0.2em] text-starlight/90">
-              {PHASE_LABEL[phase]}
+              {String(beat + 1).padStart(2, '0')} · {current.title}
             </span>
-            <span className="max-w-[62%] text-right font-mono text-[9px] leading-relaxed text-moon/75">
+            <span className="max-w-[58%] text-right font-mono text-[9px] leading-relaxed text-moon/75">
               {relic.agency} · {relic.year} · {relic.kind}
             </span>
           </div>
@@ -629,14 +1392,15 @@ export default function MissionFilm({
         {active && failed && (
           <div className="absolute inset-0 flex items-center justify-center p-4 text-center">
             <p className="text-xs leading-relaxed text-moon/80">
-              3D playback is unavailable on this device, so the mission record above stands as the source.
+              3D playback is unavailable on this device, so the narration and the mission record above stand as the
+              source.
             </p>
           </div>
         )}
 
         {active && !failed && captions && (
-          <p className="pointer-events-none absolute inset-x-0 bottom-12 mx-auto max-w-[92%] rounded-lg bg-void/70 px-3 py-1.5 text-center text-[11px] leading-snug text-starlight/90">
-            {narration[phase]}
+          <p className="pointer-events-none absolute inset-x-0 bottom-12 mx-auto max-w-[92%] rounded-lg bg-void/75 px-3 py-1.5 text-center text-[11px] leading-snug text-starlight/90">
+            {current.narration}
           </p>
         )}
 
@@ -658,24 +1422,79 @@ export default function MissionFilm({
             >
               <RotateCcw className="size-3" aria-hidden />
             </button>
-            <div className="h-[3px] flex-1 overflow-hidden rounded-full bg-white/10">
-              <div
-                className="h-full rounded-full bg-electric transition-[width] duration-150 ease-linear"
-                style={{ width: `${progress}%` }}
-              />
+            <button
+              type="button"
+              onClick={() => stepChapter(-1)}
+              aria-label="Previous chapter"
+              className="flex size-7 items-center justify-center rounded-full border border-orbit/40 bg-void/60 text-moon transition-colors hover:border-electric/70 hover:text-starlight"
+            >
+              <ChevronLeft className="size-3" aria-hidden />
+            </button>
+            <button
+              type="button"
+              onClick={() => stepChapter(1)}
+              aria-label="Next chapter"
+              className="flex size-7 items-center justify-center rounded-full border border-orbit/40 bg-void/60 text-moon transition-colors hover:border-electric/70 hover:text-starlight"
+            >
+              <ChevronRight className="size-3" aria-hidden />
+            </button>
+
+            <div className="flex flex-1 items-center gap-[3px]" aria-hidden>
+              {BEATS.map((item, index) => {
+                const share = (item.seconds / DURATION) * 100
+                const filled = index < beat ? 100 : index === beat ? ((elapsedRef.current - STARTS[index]) / item.seconds) * 100 : 0
+                return (
+                  <span key={item.id} className="h-[3px] overflow-hidden rounded-full bg-white/10" style={{ width: `${share}%` }}>
+                    <span
+                      className="block h-full rounded-full bg-electric"
+                      style={{ width: `${Math.max(0, Math.min(100, filled))}%` }}
+                    />
+                  </span>
+                )
+              })}
             </div>
             <span className="font-mono text-[9px] text-moon/55">{progress}%</span>
+            <button
+              type="button"
+              onClick={cycleSpeed}
+              aria-label={`Playback speed ${speed} times. Change speed.`}
+              className="flex items-center gap-1 rounded-full border border-orbit/40 bg-void/60 px-1.5 py-0.5 font-mono text-[9px] text-moon transition-colors hover:border-electric/70 hover:text-starlight"
+            >
+              <Gauge className="size-3" aria-hidden />
+              {speed}×
+            </button>
           </div>
         )}
       </div>
 
+      {/* Chapter rail: jump to any part of the story. */}
+      <div className="flex flex-wrap gap-1.5 px-1 pt-1 sm:px-0">
+        {BEATS.map((item, index) => (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => seekTo(index)}
+            aria-current={index === beat ? 'step' : undefined}
+            className={`flex items-center gap-1 rounded-full border px-2 py-0.5 font-display text-[9px] uppercase tracking-[0.12em] transition-colors ${
+              index === beat
+                ? 'border-electric/60 bg-electric/10 text-starlight'
+                : 'border-orbit/25 text-moon/60 hover:border-electric/40 hover:text-starlight'
+            }`}
+          >
+            <span className="font-mono text-[8px] opacity-60">{String(index + 1).padStart(2, '0')}</span>
+            {item.label}
+          </button>
+        ))}
+      </div>
+
       <div className="px-1 sm:px-0">
         <p className="py-2 text-[10px] leading-relaxed text-moon/55">
-          <span className="text-moon/80">On screen:</span> {sceneNote[phase]}
+          <span className="text-moon/80">On screen:</span> {current.note}
         </p>
         {!expanded && (
           <p className="pb-2 text-[10px] leading-relaxed text-moon/40">
-            Rendered live from this record&apos;s own NASA dataset values. Drag the scene to look around.
+            Rendered live from this record&apos;s own dataset values. Drag the scene to look around, or jump to any
+            chapter.
           </p>
         )}
       </div>
