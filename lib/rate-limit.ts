@@ -2,132 +2,80 @@
 //
 // Two backends, chosen at runtime:
 //   • Upstash Redis (when UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN are
-//     set) — a sliding window shared by every function instance. This is the
-//     only mode that truly protects the deployment as a whole.
+//     set) — an atomic sliding window shared by every function instance. This is
+//     the only mode that truly protects the deployment as a whole.
 //   • A bounded in-memory fixed window as a production-safe fallback when Redis
-//     is not configured, so a single instance still cannot be hammered and the
-//     API degrades rather than failing open completely.
+//     is not configured or is failing, so a single instance still cannot be
+//     hammered and the API degrades rather than failing open completely.
+//
+// The fallback is *not* equivalent to shared limiting, and the process says so:
+// `/api/health` reports `checks.rateLimit` and this module logs one sanitised
+// warning when it degrades (never a token, IP or header value).
 //
 // Identifiers are SHA-256 hashed before they leave the process, so no raw IP is
 // stored in Redis.
 import { createHash } from 'node:crypto'
 import { Ratelimit } from '@upstash/ratelimit'
 import { fail, PUBLIC_CORS_HEADERS } from './http'
+import { clientIpFromHeaders, createRateLimiter, rateLimitHeaders, retryAfterSeconds } from './rate-limit-core.mjs'
 import { sharedRedis } from './redis'
 
 export type PolicyName = 'read' | 'missionsRead' | 'missionsWrite'
 
-type Policy = { limit: number; windowSeconds: number }
-
-/** Generous enough for ordinary browsing; strict where writes hit the database. */
-const POLICIES: Record<PolicyName, Policy> = {
-  read: { limit: 120, windowSeconds: 60 },
-  missionsRead: { limit: 60, windowSeconds: 60 },
-  missionsWrite: { limit: 10, windowSeconds: 60 },
-}
-
 const redis = sharedRedis()
 
-/** `upstash` when shared limiting is configured, otherwise `memory`. */
-export const rateLimitMode: 'upstash' | 'memory' = redis ? 'upstash' : 'memory'
-
 const limiters = new Map<PolicyName, Ratelimit>()
-let warnedAboutFallback = false
 
-function limiter(name: PolicyName): Ratelimit | null {
-  if (!redis) return null
-  const cached = limiters.get(name)
-  if (cached) return cached
-  const policy = POLICIES[name]
-  const created = new Ratelimit({
-    redis,
-    prefix: `space-relics:${name}`,
-    limiter: Ratelimit.slidingWindow(policy.limit, `${policy.windowSeconds} s`),
-    analytics: false,
-  })
-  limiters.set(name, created)
-  return created
+/**
+ * One `Ratelimit` per policy. Each call is a single atomic Upstash command
+ * (sliding window), so separate instances cannot race past the limit with
+ * independent reads and writes.
+ */
+async function sharedLimit(name: string, identifier: string) {
+  const policyName = name as PolicyName
+  let limiter = limiters.get(policyName)
+  if (!limiter) {
+    const policy = await import('./rate-limit-core.mjs').then((core) => core.POLICIES[policyName])
+    limiter = new Ratelimit({
+      redis: redis!,
+      prefix: `space-relics:${name}`,
+      limiter: Ratelimit.slidingWindow(policy.limit, `${policy.windowSeconds} s`),
+      analytics: false,
+    })
+    limiters.set(policyName, limiter)
+  }
+  const result = await limiter.limit(identifier)
+  return { success: result.success, limit: result.limit, remaining: result.remaining, reset: result.reset }
 }
 
-type MemoryBucket = { count: number; resetAt: number }
-const buckets = new Map<string, MemoryBucket>()
+const limiter = createRateLimiter({
+  shared: redis ? sharedLimit : null,
+  onDegraded: () => {
+    console.warn('[rate-limit] shared limiter unavailable; serving from the per-instance fallback (degraded)')
+  },
+})
 
-function memoryLimit(name: PolicyName, identifier: string, now: number) {
-  const policy = POLICIES[name]
-  if (buckets.size > 5000) {
-    for (const [key, bucket] of buckets) if (bucket.resetAt <= now) buckets.delete(key)
-    if (buckets.size > 5000) buckets.clear()
-  }
-  const key = `${name}:${identifier}`
-  const existing = buckets.get(key)
-  if (!existing || existing.resetAt <= now) {
-    const bucket = { count: 1, resetAt: now + policy.windowSeconds * 1000 }
-    buckets.set(key, bucket)
-    return { allowed: true, limit: policy.limit, remaining: policy.limit - 1, reset: bucket.resetAt }
-  }
-  existing.count += 1
-  return {
-    allowed: existing.count <= policy.limit,
-    limit: policy.limit,
-    remaining: Math.max(0, policy.limit - existing.count),
-    reset: existing.resetAt,
-  }
-}
-
-export type RateLimitDecision = {
-  allowed: boolean
-  limit: number
-  remaining: number
-  reset: number
-}
-
-async function checkLimit(name: PolicyName, identifier: string): Promise<RateLimitDecision> {
-  const upstash = limiter(name)
-  if (upstash) {
-    try {
-      const result = await upstash.limit(identifier)
-      return {
-        allowed: result.success,
-        limit: result.limit,
-        remaining: result.remaining,
-        reset: result.reset,
-      }
-    } catch {
-      // Redis unreachable: never take the whole site down with it.
-      if (!warnedAboutFallback) {
-        warnedAboutFallback = true
-        console.warn('[rate-limit] shared limiter unavailable, using in-memory fallback')
-      }
-    }
-  }
-  return memoryLimit(name, identifier, Date.now())
+/**
+ * Rate-limit status for diagnostics.
+ * `mode: 'upstash'` is the only value that means deployment-wide enforcement.
+ */
+export function rateLimitStatus(): { mode: 'upstash' | 'memory' | 'upstash-degraded'; degraded: boolean } {
+  return { mode: limiter.mode(), degraded: limiter.degraded() }
 }
 
 /**
- * Client address as seen by the platform. Vercel sets these at the edge and
- * strips client-supplied values; locally they are absent, which is fine.
+ * Client address as seen by the platform.
+ *
+ * `x-real-ip` (set by the edge) wins, then Vercel's forwarded chain, then the
+ * **last** `x-forwarded-for` entry — the hop the proxy added. The first entry is
+ * attacker-controlled and is never used. See `lib/rate-limit-core.mjs`.
  */
 export function clientIp(request: Request): string {
-  const real = request.headers.get('x-real-ip')
-  if (real && real.trim()) return real.trim()
-  const forwarded = request.headers.get('x-forwarded-for')
-  if (forwarded) {
-    const first = forwarded.split(',')[0]?.trim()
-    if (first) return first
-  }
-  return 'unknown'
+  return clientIpFromHeaders(request.headers)
 }
 
 function hashIdentifier(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 32)
-}
-
-function headerRecord(decision: RateLimitDecision): Record<string, string> {
-  return {
-    'X-RateLimit-Limit': String(decision.limit),
-    'X-RateLimit-Remaining': String(decision.remaining),
-    'X-RateLimit-Reset': String(Math.ceil(decision.reset / 1000)),
-  }
 }
 
 export type RateLimitGate = { blocked: Response | null; headers: Record<string, string> }
@@ -145,11 +93,10 @@ export async function guardRateLimit(
   /** Public read endpoints must still expose their CORS policy on a 429. */
   cors = false,
 ): Promise<RateLimitGate> {
-  const decision = await checkLimit(name, hashIdentifier(clientIp(request)))
-  const headers = headerRecord(decision)
+  const decision = await limiter.check(name, hashIdentifier(clientIp(request)))
+  const headers = rateLimitHeaders(decision)
   if (decision.allowed) return { blocked: null, headers }
 
-  const retryAfter = Math.max(1, Math.ceil((decision.reset - Date.now()) / 1000))
   const blocked = fail(
     429,
     'rate_limited',
@@ -158,7 +105,7 @@ export async function guardRateLimit(
     {
       ...(cors ? PUBLIC_CORS_HEADERS : {}),
       ...headers,
-      'Retry-After': String(retryAfter),
+      'Retry-After': String(retryAfterSeconds(decision, Date.now())),
       'Cache-Control': 'no-store',
     },
   )

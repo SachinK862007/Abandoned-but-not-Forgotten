@@ -108,13 +108,31 @@ bound as a query parameter — no SQL string concatenation.
 **Migrating old local records (no silent loss)**
 
 ```bash
-npm run db:export-sqlite          # reads .data/space-relics.db → missions-export.json
+npm run db:export-sqlite          # reads .data/space-relics.db → .data/exports/missions-export.json
 npm run db:import                 # inserts them into PostgreSQL
 ```
+
+The export writes into the git-ignored `.data/exports/` directory by default
+and refuses to overwrite an existing file unless `--force` is passed. Writing
+outside that directory requires `--allow-outside`. The export contains anonymous
+session identifiers, so treat it as confidential. The export preserves the full
+launch-site name (`site_name`), mission id, session id, timestamps and every
+other legacy field; the import uses the recorded name and only falls back to
+the site id when the name is genuinely missing.
 
 The import matches on the primary key (`ON CONFLICT (id) DO NOTHING`), so it can
 be re-run without duplicating or overwriting anything. If the legacy file does
 not exist the export simply reports that there is nothing to move.
+
+### Rollback safety
+
+`npm run db:rollback` runs the newest migration's `down` step, which is
+**destructive** (it drops tables and columns). Against any database that is not
+on this machine it is refused by default. To run it deliberately you need all
+three of `--yes`, `--allow-production` and `--confirm=DELETE-DATA`, and the
+plan (affected tables, current mission count) is printed first. Use
+`--dry-run` to see the plan without changing anything. Prefer a new additive
+migration instead of a rollback in production.
 
 **Failure behaviour**: if the database is missing or unreachable, mission
 routes answer `503 database_unavailable` with a fixed message; no driver text,
@@ -132,15 +150,57 @@ query, path or stack trace is returned. `/api/health` reports
 | `missionsWrite` | `POST /api/missions` | 10 req / 60 s / IP |
 
 - Shared enforcement uses **Upstash Redis** (sliding window) when
-  `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` are set.
+  `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` are set. Each check is
+  a single atomic Upstash command, so separate function instances cannot race
+  past the limit with independent reads and writes.
 - Without those variables a bounded **in-memory** fixed window still applies,
   but it is per function instance — configure Upstash for deployment-wide
   protection. The fallback is deliberate and never fails fully open.
-- Client IPs are SHA-256 hashed before use, so no raw address is stored.
+- When Redis is configured but unreachable, the limiter degrades to the
+  in-memory fallback and `/api/health` reports `checks.rateLimit.mode` as
+  `upstash-degraded` with `ok: false`. A memory-only deployment is reported as
+  `memory` with `ok: false` only on hosted platforms (Vercel / Netlify /
+  Cloudflare Pages); locally, `memory` is the expected default and does not fail
+  the health check.
+- **Client IP extraction** (in order of precedence, all set by the platform's
+  edge and never trusted from arbitrary client headers): `x-real-ip`, then the
+  last entry of `x-vercel-forwarded-for`, then the last entry of
+  `x-forwarded-for`. The first entry of `x-forwarded-for` is attacker-controlled
+  and is never used. When none are present (local dev) everything is bucketed
+  under the constant `local`. Addresses are SHA-256 hashed before use.
 - Exceeding a limit returns **HTTP 429** with `Retry-After` and
   `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`.
   Successful responses echo the same three headers.
 - No account, key or registration is required — the API stays free and public.
+
+## Content Security Policy (report-only)
+
+`next.config.mjs` ships a `Content-Security-Policy-Report-Only` header so
+violations are observed without blocking. The app depends on Three.js/WebGL,
+NASA/JPL and Wikipedia imagery, Google fonts via `next/font`, Vercel Analytics,
+Web Audio and inline styles, so enforcing a strict policy today would break
+rendering. Before switching to an enforced `Content-Security-Policy`:
+
+- collect reports from real traffic and add every required origin explicitly
+  (no broad `https:` wildcards in `script-src`/`connect-src`);
+- confirm Three.js/WebGL, NASA/JPL images, fonts and analytics still load;
+- keep `object-src 'none'`, `base-uri 'self'`, `frame-ancestors 'self'` and HSTS.
+
+The API routes carry their own strict `default-src 'none'` policy (enforced,
+not report-only).
+
+### Vercel setup (Upstash)
+
+1. Create a Redis database at <https://console.upstash.com> (Regional, free
+   tier is fine).
+2. Copy `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
+3. Vercel: Project → Settings → Environment Variables → add **both** variables
+   to Production **and** Preview. They are server-only (never `NEXT_PUBLIC_`).
+4. Redeploy. `/api/health` should then report `checks.rateLimit.mode: "upstash"`
+   and `ok: true`.
+
+Never print, commit or paste either token anywhere other than Vercel's secret
+store.
 
 ### Public API
 

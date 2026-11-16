@@ -81,6 +81,12 @@ export type HealthReport = {
   checks: {
     database: { ok: boolean; detail: string }
     relicData: { ok: boolean; records: number }
+    /**
+     * `upstash` is the only mode that enforces limits across instances. The
+     * in-memory fallback is reported truthfully instead of being passed off as
+     * distributed protection.
+     */
+    rateLimit: { ok: boolean; mode: 'upstash' | 'memory' | 'upstash-degraded'; detail: string }
   }
 }
 

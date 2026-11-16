@@ -9,10 +9,10 @@
 //     `private, no-store`.
 //   • Mission writes require an exact same-origin Origin.
 import { randomUUID } from 'node:crypto'
+import { SESSION_COOKIE, sessionFromCookieHeader } from './cookies.mjs'
 import type { ApiErrorBody, ApiEnvelope } from './types'
 
-export const SESSION_COOKIE = 'sr_sid'
-const SESSION_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+export { SESSION_COOKIE }
 
 /** Hard cap for JSON request bodies (a mission payload is ~300 bytes). */
 export const MAX_MISSION_BYTES = 8 * 1024
@@ -162,20 +162,16 @@ export function isSameOrigin(request: Request): boolean {
   }
 }
 
-function readCookie(request: Request, name: string) {
-  const header = request.headers.get('cookie')
-  if (!header) return null
-  for (const part of header.split(';')) {
-    const [key, ...rest] = part.trim().split('=')
-    if (key === name) return decodeURIComponent(rest.join('='))
-  }
-  return null
-}
-
-/** Anonymous, temporary mission session: no account required. */
+/**
+ * Anonymous, temporary mission session: no account required.
+ *
+ * A malformed or oversized cookie is treated as "no session" rather than
+ * throwing: `decodeURIComponent` used to be able to crash an API request with
+ * a single hand-written `Cookie` header. Validation (UUID shape + length) lives
+ * in `lib/cookies.mjs`, which the tests exercise directly.
+ */
 export function getSessionId(request: Request): string | null {
-  const value = readCookie(request, SESSION_COOKIE)
-  return value && SESSION_RE.test(value) ? value : null
+  return sessionFromCookieHeader(request.headers.get('cookie'))
 }
 
 export function createSession(): { id: string; cookie: string } {
