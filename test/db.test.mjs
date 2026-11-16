@@ -75,8 +75,8 @@ after(async () => {
 
 test('migrations build the schema on a fresh database', async () => {
   const applied = await migrateUp(sql)
-  assert.deepEqual(applied, ['001_create_missions'])
-  assert.deepEqual(await appliedVersions(sql), [1])
+  assert.deepEqual(applied, ['001_create_missions', '002_add_mission_updated_at'])
+  assert.deepEqual(await appliedVersions(sql), [1, 2])
   assert.deepEqual(await pendingMigrations(sql), [])
 
   const table = await sql`SELECT table_name FROM information_schema.tables WHERE table_name = 'missions'`
@@ -122,11 +122,12 @@ test('schema constraints reject bad rows', async () => {
 })
 
 test('rolling back removes the schema and re-running rebuilds it', async () => {
-  const undone = await migrateDown(sql)
-  assert.equal(undone, '001_create_missions')
+  // v2 is the newest applied migration, so it goes first.
+  assert.equal(await migrateDown(sql), '002_add_mission_updated_at')
+  assert.equal(await migrateDown(sql), '001_create_missions')
   const table = await sql`SELECT table_name FROM information_schema.tables WHERE table_name = 'missions'`
   assert.equal(table.length, 0)
 
-  assert.deepEqual(await migrateUp(sql), ['001_create_missions'])
+  assert.deepEqual(await migrateUp(sql), ['001_create_missions', '002_add_mission_updated_at'])
   assert.equal((await listMissions('11111111-1111-4111-8111-111111111111', 10)).length, 0)
 })

@@ -20,6 +20,26 @@ yarn-error.log*
 .env*
 !.env.example
 
+# Legacy database files and any SQLite copies
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Database migration exports: these contain anonymous session identifiers.
+# Only the protected .data/exports/ location is used by default.
+/.data/exports/
+/data/exports/
+missions-export.json
+*.export.json
+*.sql
+*.sql.gz
+*.dump
+*.csv
+# Temporary migration scratch files
+*.tmp
+*.part
+
 # legacy local database (v1) + upstream cache
 /.data/
 /.cache/
