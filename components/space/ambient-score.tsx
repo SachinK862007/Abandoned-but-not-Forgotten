@@ -18,17 +18,21 @@ import { useCallback, useEffect, useRef, useState } from 'react'
  *     then suspends the AudioContext; the oscillators are never cut mid-note.
  *   • Unmuting resumes the same graph and fades back to the stored volume.
  *   • The chosen volume is remembered in localStorage.
- *   • Music only starts after a real user gesture, and the component only
- *     exists on "/" — leaving the homepage tears it down.
+ *   • Music starts automatically on every visit to "/" (browsers still need a
+ *     gesture once, so the score is armed and unlocks on the first interaction,
+ *     on focus and on a slow retry). The component only exists on "/" —
+ *     leaving the homepage tears it down, and coming back starts it again.
  */
 
 const STORAGE_KEY = 'space-relics:volume'
+/** Mute is remembered for the tab, so reopening home cannot unmute by itself. */
+const MUTED_KEY = 'space-relics:muted'
 const DEFAULT_VOLUME = 100
 /** 100% maps to unity gain; quality is protected by the limiter, not a cap. */
 const MAX_GAIN = 1
 const FADE_IN_SECONDS = 1
-const FADE_OUT_SECONDS = 1.3
-const SUSPEND_AFTER_MS = Math.round(FADE_OUT_SECONDS * 1000) + 120
+/** Slow, unhurried fade used when the visitor mutes the score. */
+const MUTE_FADE_SECONDS = 1.8
 
 const clampVolume = (value: number) => Math.min(100, Math.max(0, Math.round(value)))
 
@@ -37,6 +41,7 @@ export default function AmbientScore() {
   const masterRef = useRef<GainNode | null>(null)
   const sourcesRef = useRef<OscillatorNode[]>([])
   const noteTimerRef = useRef<number | null>(null)
+  const playNoteRef = useRef<(() => void) | null>(null)
   const suspendTimerRef = useRef<number | null>(null)
   const enabledRef = useRef(true)
   const volumeRef = useRef(DEFAULT_VOLUME)
@@ -195,6 +200,7 @@ export default function AmbientScore() {
       osc.start(now)
       osc.stop(now + 5.6)
     }
+    playNoteRef.current = playNote
     noteTimerRef.current = window.setInterval(playNote, 2900)
 
     const target = enabledRef.current ? (volumeRef.current / 100) * MAX_GAIN : 0
@@ -214,21 +220,45 @@ export default function AmbientScore() {
     clearSuspendTimer()
 
     if (enabledRef.current) {
-      // Fade first, suspend only after the tail has reached zero.
+      // Mute: fade the tail out quickly, stop scheduling notes, and then make
+      // absolutely sure the graph is silent — gain pinned to zero *and* the
+      // context suspended — rather than relying on the fade alone.
       enabledRef.current = false
       setEnabled(false)
-      ramp(0, FADE_OUT_SECONDS)
+      try {
+        window.sessionStorage.setItem(MUTED_KEY, '1')
+      } catch {
+        // storage can be blocked; muting still works for this page
+      }
+      ramp(0, MUTE_FADE_SECONDS)
+      if (noteTimerRef.current !== null) {
+        window.clearInterval(noteTimerRef.current)
+        noteTimerRef.current = null
+      }
       suspendTimerRef.current = window.setTimeout(() => {
         suspendTimerRef.current = null
         if (enabledRef.current) return
         const active = ctxRef.current
+        const master = masterRef.current
+        if (master) {
+          master.gain.cancelScheduledValues(0)
+          master.gain.setValueAtTime(0, 0)
+        }
         if (active && active.state === 'running') void active.suspend().catch(() => undefined)
-      }, SUSPEND_AFTER_MS)
+      }, Math.round(MUTE_FADE_SECONDS * 1000) + 120)
       return
     }
 
     enabledRef.current = true
     setEnabled(true)
+    try {
+      window.sessionStorage.removeItem(MUTED_KEY)
+    } catch {
+      // ignore
+    }
+    if (noteTimerRef.current === null && playNoteRef.current) {
+      noteTimerRef.current = window.setInterval(() => playNoteRef.current?.(), 2900)
+    }
     const target = (volumeRef.current / 100) * MAX_GAIN
     void ctx
       .resume()
@@ -252,6 +282,18 @@ export default function AmbientScore() {
     [ramp],
   )
 
+  // A mute chosen in this tab sticks for the tab.
+  useEffect(() => {
+    try {
+      if (window.sessionStorage.getItem(MUTED_KEY) === '1') {
+        enabledRef.current = false
+        setEnabled(false)
+      }
+    } catch {
+      // storage blocked: default to playing
+    }
+  }, [])
+
   // Restore the saved preference after hydration (server and client both render
   // 100% first, so there is no mismatch).
   useEffect(() => {
@@ -268,14 +310,42 @@ export default function AmbientScore() {
     }
   }, [])
 
-  // Autoplay policy: audio may only begin after a real gesture.
+  // Autoplay: the score should be playing whenever somebody arrives on the home
+  // page. Browsers refuse to start audio without engagement, so this tries
+  // immediately, then unlocks on the first gesture of any kind, again when the
+  // tab is brought back, and on a slow retry — and it stays armed, so the music
+  // always ends up playing unless the visitor muted it here.
   useEffect(() => {
-    const onGesture = () => start()
-    window.addEventListener('pointerdown', onGesture, { once: true })
-    window.addEventListener('keydown', onGesture, { once: true })
+    let cancelled = false
+
+    const unlock = () => {
+      if (cancelled || !enabledRef.current) return
+      const ctx = ctxRef.current
+      if (!ctx) {
+        start()
+        return
+      }
+      if (ctx.state === 'suspended') void ctx.resume().catch(() => undefined)
+    }
+
+    unlock()
+
+    const gestures = ['pointerdown', 'pointermove', 'keydown', 'wheel', 'touchstart', 'scroll'] as const
+    for (const type of gestures) window.addEventListener(type, unlock, { passive: true })
+    window.addEventListener('focus', unlock)
+    document.addEventListener('visibilitychange', unlock)
+
+    const retry = window.setInterval(() => {
+      const ctx = ctxRef.current
+      if (!ctx || ctx.state !== 'running') unlock()
+    }, 2500)
+
     return () => {
-      window.removeEventListener('pointerdown', onGesture)
-      window.removeEventListener('keydown', onGesture)
+      cancelled = true
+      for (const type of gestures) window.removeEventListener(type, unlock)
+      window.removeEventListener('focus', unlock)
+      document.removeEventListener('visibilitychange', unlock)
+      window.clearInterval(retry)
     }
   }, [start])
 

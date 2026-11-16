@@ -45,11 +45,47 @@ const securityHeaders = [
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   poweredByHeader: false,
+  // The embedded PostgreSQL used for local runs ships WASM; keep it out of the
+  // server bundle so it is loaded from node_modules at runtime instead.
+  serverExternalPackages: ['@electric-sql/pglite'],
   images: {
     unoptimized: true,
   },
   async headers() {
-    return [{ source: '/:path*', headers: securityHeaders }]
+    return [
+      // API responses are JSON only. Sealing them with their own policy means a
+      // sniffed payload can never be rendered as HTML (§XSSI / content-sniffing
+      // leaks are the classic way a JSON body ends up executing in a browser),
+      // and mission data — which is session-scoped — is additionally marked
+      // same-origin so no other site can load or embed it.
+      // Later rules win, so the narrow session-scoped rule is listed after the
+      // general API rule and tightens the policy for mission data only.
+      {
+        source: '/api/:path*',
+        headers: [
+          { key: 'Content-Security-Policy', value: "default-src 'none'; frame-ancestors 'none'; sandbox" },
+          { key: 'Cross-Origin-Resource-Policy', value: 'same-site' },
+          { key: 'X-Robots-Tag', value: 'noindex, nofollow, noarchive' },
+        ],
+      },
+      {
+        source: '/api/missions',
+        headers: [
+          { key: 'Content-Security-Policy', value: "default-src 'none'; frame-ancestors 'none'; sandbox" },
+          { key: 'Cross-Origin-Resource-Policy', value: 'same-origin' },
+          { key: 'X-Robots-Tag', value: 'noindex, nofollow, noarchive' },
+        ],
+      },
+      {
+        source: '/api/missions/:path*',
+        headers: [
+          { key: 'Content-Security-Policy', value: "default-src 'none'; frame-ancestors 'none'; sandbox" },
+          { key: 'Cross-Origin-Resource-Policy', value: 'same-origin' },
+          { key: 'X-Robots-Tag', value: 'noindex, nofollow, noarchive' },
+        ],
+      },
+      { source: '/:path*', headers: securityHeaders },
+    ]
   },
 }
 
