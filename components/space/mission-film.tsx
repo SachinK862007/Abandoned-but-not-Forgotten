@@ -34,12 +34,16 @@ import type { Relic } from '@/lib/types'
  * has been spoken.
  */
 
+// The film draws on a canvas a few hundred pixels wide, so it uses its own
+// downscaled copies of the planet maps (1024 px, ~150 KB each) instead of the
+// 4K originals the explorers need: same look, a fraction of the decode and GPU
+// upload cost.
 const BODY_TEXTURE: Record<Relic['planet'], string> = {
-  moon: '/space/textures/moon.jpg',
-  mars: '/space/textures/mars.jpg',
+  moon: '/space/textures/film/moon.jpg',
+  mars: '/space/textures/film/mars.jpg',
 }
 
-const EARTH_TEXTURE = '/space/textures/earth.jpg'
+const EARTH_TEXTURE = '/space/textures/film/earth.jpg'
 
 const BODY_TINT: Record<Relic['planet'], number> = {
   moon: 0xb6c1d4,
@@ -235,7 +239,7 @@ const PARTS: Record<VehicleKind, Part[]> = {
 const BRITISH_VOICE =
   /(google uk english|english \(united kingdom\)|^daniel|^serena|^kate|^sonia|^libby|^ryan|^hazel|^george|^arthur|^maisie|^oliver|^thomas|^amelie|uk english|british)/i
 
-function pickBritishVoice(): SpeechSynthesisVoice | null {
+function pickVoice(): SpeechSynthesisVoice | null {
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return null
   const voices = window.speechSynthesis.getVoices()
   if (!voices.length) return null
@@ -339,9 +343,16 @@ export default function MissionFilm({
   const [mounted, setMounted] = useState(false)
   const [partIndex, setPartIndex] = useState(-1)
   const [voicesReady, setVoicesReady] = useState(0)
+  const [speechKick, setSpeechKick] = useState(0)
 
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const stageRef = useRef<HTMLDivElement | null>(null)
+  const canvasHostRef = useRef<HTMLDivElement | null>(null)
+  const canvasElRef = useRef<HTMLCanvasElement | null>(null)
+  const resizeFnRef = useRef<(() => void) | null>(null)
+  const observerRef = useRef<ResizeObserver | null>(null)
+  const observedStageRef = useRef<Element | null>(null)
+  const speakTimerRef = useRef<number | null>(null)
+  const retryTimerRef = useRef<number | null>(null)
   const playingRef = useRef(false)
   const elapsedRef = useRef(0)
   const speedRef = useRef(1)
@@ -377,6 +388,26 @@ export default function MissionFilm({
     beatRef.current = beat
     setPartIndex(-1)
   }, [beat])
+
+  // Browsers only allow speech output once the page has been interacted with,
+  // and a background tab can leave the engine idle. The first real gesture and
+  // every return to a visible tab nudges the current line to speak again.
+  useEffect(() => {
+    if (!active || !voice) return
+    const kick = () => {
+      const synth = typeof window !== 'undefined' ? window.speechSynthesis : null
+      if (!synth || synth.speaking || synth.pending) return
+      setSpeechKick((value) => value + 1)
+    }
+    window.addEventListener('pointerdown', kick, { once: true })
+    window.addEventListener('keydown', kick, { once: true })
+    document.addEventListener('visibilitychange', kick)
+    return () => {
+      window.removeEventListener('pointerdown', kick)
+      window.removeEventListener('keydown', kick)
+      document.removeEventListener('visibilitychange', kick)
+    }
+  }, [active, voice])
 
   // Some browsers fill the voice list asynchronously; when it arrives, speak
   // the current line again so the narration really is the British voice.
@@ -414,28 +445,67 @@ export default function MissionFilm({
     const line = script[beat]?.narration
     if (!line) return
 
-    const utterance = new SpeechSynthesisUtterance(line)
-    const british = pickBritishVoice()
-    if (british) utterance.voice = british
-    utterance.lang = 'en-GB'
-    utterance.rate = 0.92
-    utterance.pitch = 1
-    utterance.volume = 1
-    utterance.onend = () => {
-      speechBusyRef.current = false
+    const chosen = pickVoice()
+
+    const build = (voice: SpeechSynthesisVoice | null) => {
+      const utterance = new SpeechSynthesisUtterance(line)
+      if (voice) {
+        utterance.voice = voice
+        // Match the voice that actually exists on this machine. Forcing a
+        // lang the engine has no voice for is how narration goes silently
+        // missing on some Windows and Linux setups.
+        utterance.lang = voice.lang
+      } else {
+        utterance.lang = 'en-GB'
+      }
+      utterance.rate = 0.92
+      utterance.pitch = 1
+      utterance.volume = 1
+      utterance.onend = () => {
+        speechBusyRef.current = false
+      }
+      utterance.onerror = () => {
+        speechBusyRef.current = false
+      }
+      return utterance
     }
-    utterance.onerror = () => {
-      speechBusyRef.current = false
-    }
+
     speechBusyRef.current = true
     speechStartedRef.current = Date.now()
-    synth.speak(utterance)
+
+    // Chrome/Edge drop an utterance queued in the same tick as cancel(), and
+    // can stay stuck in a paused state after a tab switch, so resume first and
+    // speak on the next tick.
+    try {
+      synth.resume()
+    } catch {
+      // older engines have no resume()
+    }
+
+    speakTimerRef.current = window.setTimeout(() => {
+      synth.speak(build(chosen))
+      // Watchdog: if the engine never started, try once more with no voice set
+      // at all, which is the most compatible path there is.
+      retryTimerRef.current = window.setTimeout(() => {
+        if (synth.speaking || synth.pending) return
+        try {
+          synth.resume()
+        } catch {
+          // ignore
+        }
+        synth.speak(build(null))
+      }, 900)
+    }, 60)
 
     return () => {
+      if (speakTimerRef.current !== null) window.clearTimeout(speakTimerRef.current)
+      if (retryTimerRef.current !== null) window.clearTimeout(retryTimerRef.current)
+      speakTimerRef.current = null
+      retryTimerRef.current = null
       synth.cancel()
       speechBusyRef.current = false
     }
-  }, [active, voice, playing, beat, script, voicesReady])
+  }, [active, voice, playing, beat, script, voicesReady, speechKick])
 
   useEffect(() => {
     return () => {
@@ -460,9 +530,8 @@ export default function MissionFilm({
 
   useEffect(() => {
     if (!active) return
-    const canvas = canvasRef.current
     const stage = stageRef.current
-    if (!canvas || !stage) return
+    if (!stage) return
 
     let disposed = false
     let raf = 0
@@ -473,11 +542,20 @@ export default function MissionFilm({
       if (disposed) return
 
       const renderer = new THREE.WebGLRenderer({
-        canvas,
         antialias: true,
         alpha: true,
         powerPreference: 'high-performance',
       })
+      // The canvas belongs to the renderer, not to React. Expanding or
+      // collapsing the player re-parents this exact element into the new stage
+      // node (see the effect below), so the WebGL context, the scene and every
+      // texture survive: the only thing that changes is the pixel size.
+      const canvas = renderer.domElement
+      canvas.className = 'size-full cursor-grab touch-none active:cursor-grabbing'
+      canvasElRef.current = canvas
+      // replaceChildren, not appendChild: a previous relic's canvas must not be
+      // left behind in the host when the film is rebuilt for a new record.
+      canvasHostRef.current?.replaceChildren(canvas)
       // 1.5 keeps the film smooth on high-density screens without quadrupling
       // the fragment work of a 3x display.
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5))
@@ -1114,8 +1192,12 @@ export default function MissionFilm({
       canvas.addEventListener('pointercancel', onUp)
 
       const resize = () => {
-        const w = stage.clientWidth
-        const h = stage.clientHeight
+        // Read the *current* stage node: maximising the player swaps the node,
+        // so a captured element would measure the detached one (0 × 0) and the
+        // buffer would stay at the inline size.
+        const el = stageRef.current
+        const w = el?.clientWidth ?? 0
+        const h = el?.clientHeight ?? 0
         if (!w || !h) return
         renderer.setSize(w, h, false)
         camera.aspect = w / h
@@ -1123,6 +1205,9 @@ export default function MissionFilm({
       }
       const observer = new ResizeObserver(resize)
       observer.observe(stage)
+      observerRef.current = observer
+      observedStageRef.current = stage
+      resizeFnRef.current = resize
       resize()
 
       // ---- loop -------------------------------------------------------------
@@ -1471,6 +1556,11 @@ export default function MissionFilm({
 
       teardown = () => {
         observer.disconnect()
+        observerRef.current = null
+        observedStageRef.current = null
+        resizeFnRef.current = null
+        canvasElRef.current = null
+        canvas.remove()
         canvas.removeEventListener('pointerdown', onDown)
         canvas.removeEventListener('pointermove', onMove)
         canvas.removeEventListener('pointerup', onUp)
@@ -1489,11 +1579,28 @@ export default function MissionFilm({
       cancelAnimationFrame(raf)
       teardown?.()
     }
-    // `expanded` matters: the player is portalled to <body> when maximised, so
-    // the <canvas> element is genuinely a new node and the renderer has to be
-    // attached to it again. Both textures are served from cache, so this is a
-    // single frame of work, once, on expand/collapse.
-  }, [active, relic.id, relic.planet, relic.latitude, relic.longitude, vehicle, expanded])
+    // Deliberately no `expanded` here: maximising the player must not rebuild
+    // the scene. The canvas is re-parented into the new stage node instead.
+  }, [active, relic.id, relic.planet, relic.latitude, relic.longitude, vehicle])
+
+  // Keep the single canvas attached to whichever stage node currently exists,
+  // and keep the ResizeObserver pointed at it. This runs after every commit, so
+  // expanding or collapsing only costs a re-parent and a resize — never a
+  // rebuild of the scene.
+  useEffect(() => {
+    const host = canvasHostRef.current
+    const canvas = canvasElRef.current
+    if (host && canvas && canvas.parentElement !== host) host.appendChild(canvas)
+
+    const stage = stageRef.current
+    const observer = observerRef.current
+    if (stage && observer && observedStageRef.current !== stage) {
+      if (observedStageRef.current) observer.unobserve(observedStageRef.current)
+      observer.observe(stage)
+      observedStageRef.current = stage
+      resizeFnRef.current?.()
+    }
+  })
 
   const toggle = useCallback(() => {
     if (!active) {
@@ -1645,9 +1752,8 @@ export default function MissionFilm({
           expanded ? 'min-h-0 flex-1 rounded-xl' : 'mt-2 aspect-[16/9]'
         }`}
       >
-        {active ? (
-          <canvas ref={canvasRef} className="size-full cursor-grab touch-none active:cursor-grabbing" />
-        ) : (
+        <div ref={canvasHostRef} className="absolute inset-0" />
+        {!active && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-[radial-gradient(120%_120%_at_50%_120%,#1a2340_0%,#05060f_65%)]">
             <p className="px-6 text-center font-display text-[11px] uppercase tracking-[0.2em] text-starlight/90">
               {relic.name}

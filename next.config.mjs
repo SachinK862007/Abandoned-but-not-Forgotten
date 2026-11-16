@@ -45,6 +45,9 @@ const securityHeaders = [
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   poweredByHeader: false,
+  // The embedded PostgreSQL used for local runs ships WASM; keep it out of the
+  // server bundle so it is loaded from node_modules at runtime instead.
+  serverExternalPackages: ['@electric-sql/pglite'],
   images: {
     unoptimized: true,
   },
