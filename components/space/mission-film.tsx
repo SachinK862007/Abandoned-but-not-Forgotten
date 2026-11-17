@@ -19,6 +19,7 @@ import type { PointerEvent as ReactPointerEvent } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { Relic } from '@/lib/types'
+import { clampSeek, createFrameLoop, holdForNarration, speechWatchdogMs } from '@/lib/film-core.mjs'
 
 /**
  * Mission film — a ten-chapter 3D story generated in the browser.
@@ -367,6 +368,8 @@ export default function MissionFilm({
   const speechStartedRef = useRef(0)
   const beatRef = useRef(0)
   const renderScheduleRef = useRef<(() => void) | null>(null)
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
+  const speechWatchdogRef = useRef<number | null>(null)
 
   const vehicle = useMemo(() => vehicleFor(relic), [relic])
   const vehicleName = VEHICLE_NAME[vehicle]
@@ -481,9 +484,24 @@ export default function MissionFilm({
     speechBusyRef.current = true
     speechStartedRef.current = Date.now()
 
+    // Keep a strong reference to the utterance we queued. Chromium and Edge
+    // garbage-collect an utterance nothing points at, and the line then never
+    // reaches the audio output at all.
+    const utterance = build(chosen)
+    utteranceRef.current = utterance
+
+    // Never let one line hold the film forever: some engines never fire
+    // `onend`, which used to leave the speaking flag set and stall playback at
+    // the end of every chapter.
+    if (speechWatchdogRef.current !== null) window.clearTimeout(speechWatchdogRef.current)
+    speechWatchdogRef.current = window.setTimeout(() => {
+      speechWatchdogRef.current = null
+      if (utteranceRef.current === utterance) speechBusyRef.current = false
+    }, speechWatchdogMs(line, 0.92))
+
     // Chrome/Edge drop an utterance queued in the same tick as cancel(), and
     // can stay stuck in a paused state after a tab switch, so resume first and
-    // speak on the next tick.
+    // speak a beat later.
     try {
       synth.resume()
     } catch {
@@ -491,9 +509,9 @@ export default function MissionFilm({
     }
 
     speakTimerRef.current = window.setTimeout(() => {
-      synth.speak(build(chosen))
-      // Watchdog: if the engine never started, try once more with no voice set
-      // at all, which is the most compatible path there is.
+      synth.speak(utterance)
+      // Fallback: if the engine never started, speak once more with no voice
+      // set at all, which is the most compatible path there is.
       retryTimerRef.current = window.setTimeout(() => {
         if (synth.speaking || synth.pending) return
         try {
@@ -501,15 +519,20 @@ export default function MissionFilm({
         } catch {
           // ignore
         }
-        synth.speak(build(null))
+        const fallback = build(null)
+        utteranceRef.current = fallback
+        synth.speak(fallback)
       }, 900)
-    }, 60)
+    }, 120)
 
     return () => {
       if (speakTimerRef.current !== null) window.clearTimeout(speakTimerRef.current)
       if (retryTimerRef.current !== null) window.clearTimeout(retryTimerRef.current)
+      if (speechWatchdogRef.current !== null) window.clearTimeout(speechWatchdogRef.current)
       speakTimerRef.current = null
       retryTimerRef.current = null
+      speechWatchdogRef.current = null
+      if (utteranceRef.current === utterance) utteranceRef.current = null
       synth.cancel()
       speechBusyRef.current = false
     }
@@ -542,7 +565,6 @@ export default function MissionFilm({
     if (!stage) return
 
     let disposed = false
-    let raf = 0
     let teardown: (() => void) | null = null
 
     const boot = async () => {
@@ -1267,10 +1289,15 @@ export default function MissionFilm({
 
         if (playingRef.current) {
           // Hold the last shot of a chapter until its narration finishes.
-          const speaking = speechBusyRef.current && voiceRef.current && !isLast
-          const recent = Date.now() - speechStartedRef.current < (beatDef.seconds + 12) * 1000
+          const holding = holdForNarration({
+            speechBusy: speechBusyRef.current,
+            voiceOn: voiceRef.current,
+            isLast,
+            msSinceSpeechStart: Date.now() - speechStartedRef.current,
+            beatSeconds: beatDef.seconds,
+          })
           let next = elapsedRef.current + dt * speedRef.current
-          if (speaking && recent) next = Math.min(next, beatEnd - 0.05)
+          if (holding) next = Math.min(next, beatEnd - 0.05)
           elapsedRef.current = Math.min(DURATION, next)
           if (elapsedRef.current >= DURATION) {
             playingRef.current = false
@@ -1561,16 +1588,34 @@ export default function MissionFilm({
         }
 
         renderer.render(scene, camera)
-        if (playingRef.current) schedule()
+        if (playingRef.current) loop.schedule()
       }
-      const schedule = () => {
-        if (disposed || raf) return
-        raf = requestAnimationFrame(tick)
+
+      // One frame loop for the lifetime of this scene. `createFrameLoop` clears
+      // its handle *before* running the frame, so a frame that has just finished
+      // can queue the next one. The previous inline scheduler kept the old handle
+      // set, so the animation stopped after a single frame and only restarted
+      // when some unrelated event happened to call it again.
+      const loop = createFrameLoop({
+        requestFrame: (callback: FrameRequestCallback) => requestAnimationFrame(callback),
+        cancelFrame: (handle: number) => cancelAnimationFrame(handle),
+        onFrame: tick,
+      })
+      renderScheduleRef.current = () => loop.schedule()
+      loop.schedule()
+
+      // A hidden tab stops receiving frames. On return, drop the stale timestamp
+      // so the first frame does not jump, and make sure the loop is alive again.
+      const onVisibility = () => {
+        if (document.visibilityState !== 'visible') return
+        last = performance.now()
+        loop.schedule()
       }
-      renderScheduleRef.current = schedule
-      schedule()
+      document.addEventListener('visibilitychange', onVisibility)
 
       teardown = () => {
+        loop.cancel()
+        document.removeEventListener('visibilitychange', onVisibility)
         renderScheduleRef.current = null
         observer.disconnect()
         observerRef.current = null
@@ -1594,7 +1639,6 @@ export default function MissionFilm({
     return () => {
       disposed = true
       renderScheduleRef.current = null
-      cancelAnimationFrame(raf)
       teardown?.()
     }
     // Deliberately no `expanded` here: maximising the player must not rebuild
@@ -1620,25 +1664,51 @@ export default function MissionFilm({
     }
   })
 
+  /**
+   * Edge and Chromium only let the speech engine run once the document has a
+   * real user gesture, and a fresh engine can sit paused. Calling this straight
+   * from the click handler unlocks it before the narration effect schedules the
+   * first line. The unlock utterance is silent, so nothing is heard twice.
+   */
+  const primeSpeech = useCallback(() => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return
+    const synth = window.speechSynthesis
+    try {
+      synth.resume()
+    } catch {
+      // older engines have no resume()
+    }
+    try {
+      const unlock = new SpeechSynthesisUtterance(' ')
+      unlock.volume = 0
+      unlock.rate = 2
+      synth.speak(unlock)
+    } catch {
+      // nothing to unlock on this engine
+    }
+  }, [])
+
   const toggle = useCallback(() => {
+    primeSpeech()
     if (!active) {
       setActive(true)
       setPlaying(true)
       return
     }
     setPlaying((value) => !value)
-  }, [active])
+  }, [active, primeSpeech])
 
   const replay = useCallback(() => {
+    primeSpeech()
     elapsedRef.current = 0
     setProgress(0)
     setBeat(0)
     setActive(true)
     setPlaying(true)
-  }, [])
+  }, [primeSpeech])
 
   const seekTime = useCallback((seconds: number) => {
-    const clamped = Math.max(0, Math.min(DURATION - 0.001, seconds))
+    const clamped = clampSeek(seconds, DURATION)
     elapsedRef.current = clamped
     setBeat(beatIndexAt(clamped))
     setProgress(Math.round((clamped / DURATION) * 100))

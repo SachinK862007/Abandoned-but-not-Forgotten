@@ -87,6 +87,11 @@ export type HealthReport = {
      * distributed protection.
      */
     rateLimit: { ok: boolean; mode: 'upstash' | 'memory' | 'upstash-degraded'; detail: string }
+    /**
+     * The shared store is probed with a real command, so this reports
+     * connectivity rather than whether the variables are set.
+     */
+    redis: { ok: boolean; configured: boolean; detail: string }
   }
 }
 

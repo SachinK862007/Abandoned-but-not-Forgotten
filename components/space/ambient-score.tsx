@@ -2,6 +2,7 @@
 
 import { ChevronUp, Music2, Volume2, VolumeX } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { DEFAULT_ENABLED, DEFAULT_VOLUME, clampVolume, targetGain } from '@/lib/ambient-score-core.mjs'
 
 /**
  * Home-page ambient score with volume control.
@@ -24,14 +25,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
  */
 
 const STORAGE_KEY = 'space-relics:volume'
-const DEFAULT_VOLUME = 100
-/** 100% maps to unity gain; quality is protected by the limiter, not a cap. */
-const MAX_GAIN = 1
 const FADE_IN_SECONDS = 1
 /** Slow, unhurried fade used when the visitor mutes the score. */
 const MUTE_FADE_SECONDS = 1.8
 
-const clampVolume = (value: number) => Math.min(100, Math.max(0, Math.round(value)))
+
 
 export default function AmbientScore() {
   const ctxRef = useRef<AudioContext | null>(null)
@@ -40,10 +38,10 @@ export default function AmbientScore() {
   const noteTimerRef = useRef<number | null>(null)
   const playNoteRef = useRef<(() => void) | null>(null)
   const suspendTimerRef = useRef<number | null>(null)
-  const enabledRef = useRef(true)
+  const enabledRef = useRef(DEFAULT_ENABLED)
   const volumeRef = useRef(DEFAULT_VOLUME)
 
-  const [enabled, setEnabled] = useState(true)
+  const [enabled, setEnabled] = useState(DEFAULT_ENABLED)
   const [volume, setVolume] = useState(DEFAULT_VOLUME)
   const [hovered, setHovered] = useState(false)
   const [pinned, setPinned] = useState(false)
@@ -200,7 +198,7 @@ export default function AmbientScore() {
     playNoteRef.current = playNote
     noteTimerRef.current = window.setInterval(playNote, 2900)
 
-    const target = enabledRef.current ? (volumeRef.current / 100) * MAX_GAIN : 0
+    const target = targetGain(volumeRef.current, enabledRef.current)
     master.gain.linearRampToValueAtTime(target, ctx.currentTime + 2.2)
     void ctx.resume().catch(() => undefined)
   }, [])
@@ -247,7 +245,7 @@ export default function AmbientScore() {
     if (noteTimerRef.current === null && playNoteRef.current) {
       noteTimerRef.current = window.setInterval(() => playNoteRef.current?.(), 2900)
     }
-    const target = (volumeRef.current / 100) * MAX_GAIN
+    const target = targetGain(volumeRef.current, true)
     void ctx
       .resume()
       .then(() => ramp(target, FADE_IN_SECONDS))
@@ -265,7 +263,7 @@ export default function AmbientScore() {
         // Storage can be blocked (private mode); the session still works.
       }
       // Changing volume while muted only records the preference.
-      if (enabledRef.current) ramp((value / 100) * MAX_GAIN, 0.08)
+      if (enabledRef.current) ramp(targetGain(value, true), 0.08)
     },
     [ramp],
   )

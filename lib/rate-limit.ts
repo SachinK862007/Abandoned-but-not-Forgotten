@@ -17,6 +17,7 @@
 import { createHash } from 'node:crypto'
 import { Ratelimit } from '@upstash/ratelimit'
 import { fail, PUBLIC_CORS_HEADERS } from './http'
+import { checkSharedStore } from './health-core.mjs'
 import { clientIpFromHeaders, createRateLimiter, rateLimitHeaders, retryAfterSeconds } from './rate-limit-core.mjs'
 import { sharedRedis } from './redis'
 
@@ -61,6 +62,24 @@ const limiter = createRateLimiter({
  */
 export function rateLimitStatus(): { mode: 'upstash' | 'memory' | 'upstash-degraded'; degraded: boolean } {
   return { mode: limiter.mode(), degraded: limiter.degraded() }
+}
+
+/** True when the shared store has both of its REST variables. */
+export function isRedisConfigured(): boolean {
+  return redis !== null
+}
+
+/**
+ * Probes the shared store with a real `PING`.
+ *
+ * The health endpoint must not claim Redis is healthy just because its
+ * environment variables exist, and it must not spend rate-limit quota or hang
+ * on an unreachable host: `checkSharedStore` bounds the probe and reports
+ * `not configured`, `unreachable` or `timed out` without leaking anything.
+ */
+export function pingRedis(timeoutMs = 1500) {
+  const client = redis
+  return checkSharedStore(client ? () => client.ping() : null, { timeoutMs })
 }
 
 /**
