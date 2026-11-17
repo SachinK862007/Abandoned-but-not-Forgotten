@@ -203,6 +203,17 @@ try {
   log('switching relic removes the old scene', switched.canvases === 0, `canvases=${switched.canvases}`)
   log('switching relic stops the narration', switched.speaking === false, `speaking=${switched.speaking}`)
 
+  // Reopening on the new record must build one fresh scene, not stack another.
+  await page.getByRole('button', { name: 'Play film' }).first().click()
+  await page.waitForTimeout(2200)
+  const reopened = await probe()
+  const reopenedFps = await framesPerSecond(1200)
+  log(
+    'reopening plays with a single fresh scene',
+    reopened.canvases === 1 && reopened.utterances > 0 && reopenedFps > 20,
+    `canvases=${reopened.canvases} frames/s=${reopenedFps}`,
+  )
+
   // ------------------------------------------------------------ page errors
   const ignorable = /_vercel\/insights|Download the React DevTools/i
   const realErrors = pageErrors.filter((text) => !ignorable.test(text))
