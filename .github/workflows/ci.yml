@@ -10,9 +10,14 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
+      # `Lonch game/launch-lab` lives in a private repository, so a CI run with
+      # no token cannot clone it. Check out this repository first and try the
+      # submodule separately, so its absence cannot fail the whole job.
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Optional launch-lab submodule
+        continue-on-error: true
+        run: git submodule update --init --recursive
 
       - uses: actions/setup-node@v4
         with:
@@ -21,5 +26,8 @@ jobs:
 
       - run: npm ci
       - run: npm run typecheck
-      - run: npm run test:all
+      - run: npm run test:app
+      - name: Simulation tests (require the launch-lab submodule)
+        if: hashFiles('Lonch game/launch-lab/test/sim.test.mjs') != ''
+        run: npm run test:sim
       - run: npm run build
