@@ -1695,6 +1695,16 @@ export default function MissionFilm({
       setPlaying(true)
       return
     }
+    // At the very end of the story the play button used to resume a timeline
+    // that was already full, so the first frame finished it again and nothing
+    // happened. Starting from the top is what the button promises there.
+    if (!playingRef.current && elapsedRef.current >= DURATION - 0.01) {
+      elapsedRef.current = 0
+      setProgress(0)
+      setBeat(0)
+      setPlaying(true)
+      return
+    }
     setPlaying((value) => !value)
   }, [active, primeSpeech])
 

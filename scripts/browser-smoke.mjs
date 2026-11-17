@@ -145,6 +145,57 @@ try {
   log('seek moves the timeline', (await progress()) !== resumedProgress, `progress=${await progress()}`)
   log('seek keeps one canvas', seeked.canvases === 1, `canvases=${seeked.canvases}`)
 
+  // ------------------------------------------ expand, resize, restart (G)
+  await page.getByRole('button', { name: 'Expand film' }).click()
+  await page.waitForTimeout(800)
+  const expandedState = await ev(() => {
+    const canvas = document.querySelector('canvas')
+    return {
+      canvases: document.querySelectorAll('canvas').length,
+      width: canvas?.width ?? 0,
+    }
+  })
+  log(
+    'expanding re-parents the same canvas',
+    expandedState.canvases === 1 && expandedState.width > 0,
+    JSON.stringify(expandedState),
+  )
+
+  await page.getByRole('button', { name: 'Collapse film' }).click()
+  await page.waitForTimeout(800)
+  // Measure the film's own canvas: the drawing buffer must follow the stage
+  // through a layout change (1280 two-column -> 640 single column).
+  const filmCanvas = () =>
+    ev(() => {
+      const stage = document.querySelector('[aria-label^="Mission film scene"]')
+      const canvas = stage?.querySelector('canvas')
+      return { buffer: canvas?.width ?? 0, css: stage?.clientWidth ?? 0 }
+    })
+  const beforeResize = await filmCanvas()
+  await page.setViewportSize({ width: 640, height: 860 })
+  await page.waitForTimeout(900)
+  const afterResize = await filmCanvas()
+  log(
+    'resizing redraws at the new size',
+    afterResize.buffer > 0 && afterResize.buffer !== beforeResize.buffer,
+    `${beforeResize.buffer}px@${beforeResize.css}css -> ${afterResize.buffer}px@${afterResize.css}css`,
+  )
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.waitForTimeout(700)
+
+  // The film must be replayable by pressing Play at the very end, not only
+  // through the separate Replay button.
+  const slider = page.locator('[role="slider"]').first()
+  const sliderBox = await slider.boundingBox()
+  await page.mouse.click(sliderBox.x + sliderBox.width * 0.995, sliderBox.y + sliderBox.height / 2)
+  await page.waitForTimeout(2500)
+  const finishedProgress = await progress()
+  log('the film reaches its end', finishedProgress === '100', `progress=${finishedProgress}`)
+  await page.getByRole('button', { name: 'Play film' }).first().click()
+  await page.waitForTimeout(1500)
+  const restartedProgress = Number(await progress())
+  log('play at the end restarts the story', restartedProgress < 20, `progress=${restartedProgress}`)
+
   // --------------------------------------------------------- change relic
   await relics.nth(1).click()
   await page.waitForTimeout(1200)
