@@ -25,6 +25,7 @@
     "test:film": "node --test test/film.test.mjs",
     "test:ambient": "node --test test/ambient-score.test.mjs",
     "test:health": "node --test test/health.test.mjs",
+    "test:browser": "node scripts/browser-smoke.mjs",
     "test:app": "npm run test:db && npm run test:http && npm run test:rate-limit && npm run test:film && npm run test:ambient && npm run test:health",
     "test:all": "npm run test:sim && npm run test:db && npm run test:http && npm run test:rate-limit && npm run test:film && npm run test:ambient && npm run test:health"
   },
