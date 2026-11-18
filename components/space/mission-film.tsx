@@ -19,7 +19,8 @@ import type { PointerEvent as ReactPointerEvent } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { Relic } from '@/lib/types'
-import { clampSeek, createFrameLoop, holdForNarration, speechWatchdogMs } from '@/lib/film-core.mjs'
+import { clampSeek, createFrameLoop, holdForNarration } from '@/lib/film-core.mjs'
+import { createNarration } from '@/lib/narration.mjs'
 
 /**
  * Mission film — a ten-chapter 3D story generated in the browser.
@@ -233,22 +234,12 @@ const PARTS: Record<VehicleKind, Part[]> = {
 }
 
 /**
- * British English narrator. Chrome/Edge ship "Google UK English", Windows
- * ships Ryan/Libby/Sonia/George, macOS ships Daniel/Serena/Kate — the first
- * match wins, and an en-GB tag is set even when only a generic voice exists.
+ * Voice selection and the whole speak/cancel lifecycle live in
+ * `lib/narration.mjs`, so the Node test suite exercises the same code the
+ * player runs. A local British voice wins; a remote Edge "natural" voice is
+ * never preferred, because those stall silently when their service is
+ * unreachable.
  */
-const BRITISH_VOICE =
-  /(google uk english|english \(united kingdom\)|^daniel|^serena|^kate|^sonia|^libby|^ryan|^hazel|^george|^arthur|^maisie|^oliver|^thomas|^amelie|uk english|british)/i
-
-function pickVoice(): SpeechSynthesisVoice | null {
-  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return null
-  const voices = window.speechSynthesis.getVoices()
-  if (!voices.length) return null
-  const exact = voices.filter((voice) => voice.lang.replace('_', '-').toLowerCase() === 'en-gb')
-  const english = voices.filter((voice) => /^en/i.test(voice.lang))
-  const pool = exact.length ? exact : english.length ? english : voices
-  return pool.find((voice) => BRITISH_VOICE.test(voice.name)) ?? pool[0] ?? null
-}
 
 function fill(template: string, values: Record<string, string>) {
   return template.replace(/\{(\w+)\}/g, (_, key: string) => values[key] ?? '')
@@ -349,8 +340,7 @@ export default function MissionFilm({
   const [speed, setSpeed] = useState(1)
   const [mounted, setMounted] = useState(false)
   const [partIndex, setPartIndex] = useState(-1)
-  const [voicesReady, setVoicesReady] = useState(0)
-  const [speechKick, setSpeechKick] = useState(0)
+  const [narrationStatus, setNarrationStatus] = useState<'idle' | 'queued' | 'speaking' | 'failed'>('idle')
 
   const stageRef = useRef<HTMLDivElement | null>(null)
   const canvasHostRef = useRef<HTMLDivElement | null>(null)
@@ -358,8 +348,6 @@ export default function MissionFilm({
   const resizeFnRef = useRef<(() => void) | null>(null)
   const observerRef = useRef<ResizeObserver | null>(null)
   const observedStageRef = useRef<Element | null>(null)
-  const speakTimerRef = useRef<number | null>(null)
-  const retryTimerRef = useRef<number | null>(null)
   const playingRef = useRef(false)
   const elapsedRef = useRef(0)
   const speedRef = useRef(1)
@@ -368,8 +356,7 @@ export default function MissionFilm({
   const speechStartedRef = useRef(0)
   const beatRef = useRef(0)
   const renderScheduleRef = useRef<(() => void) | null>(null)
-  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
-  const speechWatchdogRef = useRef<number | null>(null)
+  const narrationRef = useRef<ReturnType<typeof createNarration> | null>(null)
 
   const vehicle = useMemo(() => vehicleFor(relic), [relic])
   const vehicleName = VEHICLE_NAME[vehicle]
@@ -400,34 +387,32 @@ export default function MissionFilm({
     setPartIndex(-1)
   }, [beat])
 
-  // Browsers only allow speech output once the page has been interacted with,
-  // and a background tab can leave the engine idle. The first real gesture and
-  // every return to a visible tab nudges the current line to speak again.
-  useEffect(() => {
-    if (!active || !voice) return
-    const kick = () => {
-      const synth = typeof window !== 'undefined' ? window.speechSynthesis : null
-      if (!synth || synth.speaking || synth.pending) return
-      setSpeechKick((value) => value + 1)
-    }
-    window.addEventListener('pointerdown', kick, { once: true })
-    window.addEventListener('keydown', kick, { once: true })
-    document.addEventListener('visibilitychange', kick)
-    return () => {
-      window.removeEventListener('pointerdown', kick)
-      window.removeEventListener('keydown', kick)
-      document.removeEventListener('visibilitychange', kick)
-    }
-  }, [active, voice])
-
-  // Some browsers fill the voice list asynchronously; when it arrives, speak
-  // the current line again so the narration really is the British voice.
+  // One narration controller for the lifetime of the player. Owning the
+  // queue, the timers and the utterance reference in one place is what makes
+  // "one line at a time" enforceable; the previous per-effect cancel() could
+  // kill a line that had just been queued (measured in Edge: four cancels and
+  // an interrupted unlock within 1.7 s of pressing Play).
   useEffect(() => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return
-    const synth = window.speechSynthesis
-    const bump = () => setVoicesReady((value) => value + 1)
-    synth.addEventListener?.('voiceschanged', bump)
-    return () => synth.removeEventListener?.('voiceschanged', bump)
+    if (typeof SpeechSynthesisUtterance === 'undefined') return
+
+    const controller = createNarration({
+      synth: window.speechSynthesis,
+      makeUtterance: (text) => new SpeechSynthesisUtterance(text),
+      schedule: (callback, ms) => window.setTimeout(callback, ms),
+      cancelTimer: (handle) => window.clearTimeout(handle),
+      onStatus: (next) => {
+        setNarrationStatus(next as 'idle' | 'queued' | 'speaking' | 'failed')
+        speechBusyRef.current = next === 'queued' || next === 'speaking'
+        if (next === 'speaking') speechStartedRef.current = Date.now()
+      },
+    })
+    narrationRef.current = controller
+    return () => {
+      narrationRef.current = null
+      controller.dispose()
+      speechBusyRef.current = false
+    }
   }, [])
 
   // A different mission selected: back to the poster.
@@ -445,104 +430,35 @@ export default function MissionFilm({
     setPlaying(true)
   }, [autoPlayToken])
 
-  // Narration follows the current chapter and stops when the film pauses.
+  // Narration follows the current chapter and stops whenever the film is not
+  // audibly playing. The controller never cancels a line it has just queued,
+  // and reports a line that never starts, so a silent engine can no longer
+  // look like a narrated film.
   useEffect(() => {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return
-    const synth = window.speechSynthesis
-    synth.cancel()
-    speechBusyRef.current = false
-    if (!active || !voice || !playing) return
-
+    const controller = narrationRef.current
+    if (!controller) return
     const line = script[beat]?.narration
-    if (!line) return
-
-    const chosen = pickVoice()
-
-    const build = (voice: SpeechSynthesisVoice | null) => {
-      const utterance = new SpeechSynthesisUtterance(line)
-      if (voice) {
-        utterance.voice = voice
-        // Match the voice that actually exists on this machine. Forcing a
-        // lang the engine has no voice for is how narration goes silently
-        // missing on some Windows and Linux setups.
-        utterance.lang = voice.lang
-      } else {
-        utterance.lang = 'en-GB'
-      }
-      utterance.rate = 0.92
-      utterance.pitch = 1
-      utterance.volume = 1
-      utterance.onend = () => {
-        speechBusyRef.current = false
-      }
-      utterance.onerror = () => {
-        speechBusyRef.current = false
-      }
-      return utterance
+    if (!active || !voice || !playing || !line) {
+      controller.stop()
+      return
     }
+    controller.speak(line)
+  }, [active, voice, playing, beat, script])
 
-    speechBusyRef.current = true
-    speechStartedRef.current = Date.now()
-
-    // Keep a strong reference to the utterance we queued. Chromium and Edge
-    // garbage-collect an utterance nothing points at, and the line then never
-    // reaches the audio output at all.
-    const utterance = build(chosen)
-    utteranceRef.current = utterance
-
-    // Never let one line hold the film forever: some engines never fire
-    // `onend`, which used to leave the speaking flag set and stall playback at
-    // the end of every chapter.
-    if (speechWatchdogRef.current !== null) window.clearTimeout(speechWatchdogRef.current)
-    speechWatchdogRef.current = window.setTimeout(() => {
-      speechWatchdogRef.current = null
-      if (utteranceRef.current === utterance) speechBusyRef.current = false
-    }, speechWatchdogMs(line, 0.92))
-
-    // Chrome/Edge drop an utterance queued in the same tick as cancel(), and
-    // can stay stuck in a paused state after a tab switch, so resume first and
-    // speak a beat later.
-    try {
-      synth.resume()
-    } catch {
-      // older engines have no resume()
-    }
-
-    speakTimerRef.current = window.setTimeout(() => {
-      synth.speak(utterance)
-      // Fallback: if the engine never started, speak once more with no voice
-      // set at all, which is the most compatible path there is.
-      retryTimerRef.current = window.setTimeout(() => {
-        if (synth.speaking || synth.pending) return
-        try {
-          synth.resume()
-        } catch {
-          // ignore
-        }
-        const fallback = build(null)
-        utteranceRef.current = fallback
-        synth.speak(fallback)
-      }, 900)
-    }, 120)
-
-    return () => {
-      if (speakTimerRef.current !== null) window.clearTimeout(speakTimerRef.current)
-      if (retryTimerRef.current !== null) window.clearTimeout(retryTimerRef.current)
-      if (speechWatchdogRef.current !== null) window.clearTimeout(speechWatchdogRef.current)
-      speakTimerRef.current = null
-      retryTimerRef.current = null
-      speechWatchdogRef.current = null
-      if (utteranceRef.current === utterance) utteranceRef.current = null
-      synth.cancel()
-      speechBusyRef.current = false
-    }
-  }, [active, voice, playing, beat, script, voicesReady, speechKick])
-
+  // A background tab can leave the engine idle. Returning to a visible tab
+  // re-queues the current line once, and only when the film is playing and
+  // nothing is already in flight — no polling, no retry loop.
   useEffect(() => {
-    return () => {
-      if (typeof window !== 'undefined' && 'speechSynthesis' in window) window.speechSynthesis.cancel()
+    if (!active || !voice) return
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return
+      if (!playingRef.current) return
+      const controller = narrationRef.current
+      if (controller && !controller.isBusy()) controller.retry()
     }
-  }, [])
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [active, voice])
 
   // Expanded player: Esc closes, page scroll is parked.
   useEffect(() => {
@@ -1779,6 +1695,19 @@ export default function MissionFilm({
         </div>
 
         <div className="flex items-center gap-1.5">
+          {voice && narrationStatus === 'failed' && (
+            <button
+              type="button"
+              onClick={() => {
+                primeSpeech()
+                narrationRef.current?.retry()
+              }}
+              aria-label="Retry narration"
+              className="rounded-full border border-amber-300/50 bg-amber-300/10 px-2 py-0.5 font-display text-[9px] uppercase tracking-[0.14em] text-amber-200 transition-colors hover:border-amber-300 hover:text-amber-100"
+            >
+              Retry audio
+            </button>
+          )}
           <p className="mr-1 hidden font-mono text-[9px] uppercase tracking-[0.16em] text-moon/45 sm:block">
             {BODY_LABEL[relic.planet]} · {vehicleName}
           </p>

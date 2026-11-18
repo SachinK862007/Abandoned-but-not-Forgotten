@@ -9,10 +9,13 @@ the missions you fly.
 | Where | Node version |
 | --- | --- |
 | Local development | **24** (`.nvmrc`, `nvm use`) |
-| Vercel | **26.x** (as already configured in the project) |
-| Minimum accepted by `engines` | **22.5** |
+| CI (GitHub Actions) | **24** (`node-version-file: .nvmrc`) |
+| Vercel | **24.x** (from `engines`; pin it in the project settings too) |
 
-`package.json` declares `"engines": { "node": ">=22.5.0" }`, which covers both.
+`package.json` declares `"engines": { "node": "24.x" }`. That is a bounded
+range on purpose: an open range such as `>=22.5.0` lets the platform move the
+build to a future major version on its own, which is what produced Vercel's
+"may automatically upgrade to a future major Node version" warning.
 `npm run dev` and `npm run build` also run `scripts/check-node.mjs`, which stops
 with a clear message instead of a crash on an unsupported runtime.
 

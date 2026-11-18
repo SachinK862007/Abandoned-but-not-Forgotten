@@ -5,8 +5,11 @@
  * Runs in real Microsoft Edge (Chromium channel `msedge`) and checks the things
  * that cannot be covered by the Node test suite:
  *
- *   • the homepage renders and the ambient score starts silent;
- *   • the mission film renders a single canvas;
+ *   • the homepage renders, defaults to unmuted at 40% and *attempts* autoplay;
+ *   • a refused autoplay is reported and unlocked by one click;
+ *   • mute/unmute/volume work, and leaving the page closes the player;
+ *   • the mission film renders a single canvas and narration really starts
+ *     (the speech engine's `start` event, not its `speaking` flag);
  *   • playback actually advances across frames (the frame loop keeps going);
  *   • narration reaches the speech engine and pauses with the film;
  *   • pause freezes the timeline and stops scheduling frames;
@@ -70,6 +73,10 @@ const progress = () =>
   page.evaluate(
     () => document.querySelector('[role="slider"][aria-label^="Film timeline"]')?.getAttribute('aria-valuenow') ?? null,
   )
+const sliderValue = () =>
+  page.evaluate(
+    () => document.querySelector('input[aria-label="Background music volume"]')?.value ?? null,
+  )
 const framesPerSecond = async (ms = 1500) => {
   const before = await probe()
   await page.waitForTimeout(ms)
@@ -80,19 +87,94 @@ const framesPerSecond = async (ms = 1500) => {
 try {
   // ------------------------------------------------------------- homepage
   await page.goto(`${BASE}/`, { waitUntil: 'domcontentloaded' })
-  const ambient = page.getByRole('button', { name: /ambient score/i })
-  await ambient.waitFor({ timeout: FILM_TIMEOUT })
-  await page.waitForTimeout(800)
+  const musicToggle = page.getByRole('button', { name: 'Unmute background music', exact: true })
+  const muteButton = page.getByRole('button', { name: 'Mute background music', exact: true })
+  await musicToggle.waitFor({ timeout: FILM_TIMEOUT })
 
-  const ambientState = await page.evaluate(() => {
-    const button = document.querySelector('button[aria-label*="ambient score" i]')
-    return button ? { label: button.getAttribute('aria-label'), pressed: button.getAttribute('aria-pressed') } : null
-  })
+  const musicStatus = () =>
+    page.evaluate(() => document.querySelector('[data-music-status]')?.getAttribute('data-music-status') ?? null)
+  let status = null
+  for (let i = 0; i < 40; i += 1) {
+    status = await musicStatus()
+    if (status === 'playing' || status === 'blocked') break
+    await page.waitForTimeout(250)
+  }
+
+  const homeAudio = await probe()
   log('homepage renders', Boolean(await page.title()), await page.title())
+  log('home music attempts autoplay on load', homeAudio.contexts.created >= 1, JSON.stringify(homeAudio.contexts))
+  log('only one player runs at a time', homeAudio.contexts.running <= 1, JSON.stringify(homeAudio.contexts))
+  log('fresh load is unmuted at 40%', (await sliderValue()) === '40', `slider=${await sliderValue()}`)
   log(
-    'ambient score starts silent',
-    ambientState?.label === 'Play ambient score' && ambientState?.pressed === 'false',
-    JSON.stringify(ambientState),
+    'the autoplay outcome is reported honestly',
+    status === 'playing' || status === 'blocked',
+    `status=${status}`,
+  )
+
+  if (status === 'blocked') {
+    await page.getByRole('button', { name: 'Enable background music' }).click()
+    for (let i = 0; i < 25 && (await musicStatus()) !== 'playing'; i += 1) await page.waitForTimeout(150)
+    log('one click unlocks a refused autoplay', (await musicStatus()) === 'playing', `status=${await musicStatus()}`)
+  } else {
+    log('one click unlocks a refused autoplay', true, 'autoplay was allowed in this run')
+  }
+
+  log('the playing state is shown truthfully', await muteButton.isVisible(), 'mute control offered')
+  await muteButton.click()
+  await page.waitForTimeout(400)
+  log(
+    'mute fades out and reports muted',
+    (await musicStatus()) === 'muted' && (await musicToggle.isVisible()),
+    `status=${await musicStatus()}`,
+  )
+  await musicToggle.click()
+  await page.waitForTimeout(400)
+  log('unmute resumes the music', (await musicStatus()) === 'playing', `status=${await musicStatus()}`)
+
+  await muteButton.hover()
+  await page.getByRole('slider', { name: 'Background music volume' }).fill('30')
+  await page.waitForTimeout(250)
+  log('the volume slider applies immediately', (await sliderValue()) === '30', `slider=${await sliderValue()}`)
+  await page.getByRole('slider', { name: 'Background music volume' }).fill('0')
+  await page.waitForTimeout(300)
+  log('volume zero is silence', (await musicStatus()) === 'muted', `status=${await musicStatus()}`)
+  await page.getByRole('slider', { name: 'Background music volume' }).fill('40')
+  await page.waitForTimeout(400)
+  log('raising the volume restores sound', (await musicStatus()) === 'playing', `status=${await musicStatus()}`)
+
+  // A mute must never survive a reload: the first load is always unmuted.
+  await muteButton.click()
+  await page.waitForTimeout(350)
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await page.getByRole('button', { name: /background music/i }).first().waitFor({ timeout: FILM_TIMEOUT })
+  let reloadedStatus = null
+  for (let i = 0; i < 40; i += 1) {
+    reloadedStatus = await musicStatus()
+    if (reloadedStatus === 'playing' || reloadedStatus === 'blocked') break
+    await page.waitForTimeout(250)
+  }
+  log(
+    'a reload after muting is not muted',
+    reloadedStatus !== 'muted' && (await sliderValue()) === '40',
+    `status=${reloadedStatus} slider=${await sliderValue()}`,
+  )
+
+  // ------------------------------------------------- leaving the homepage
+  // Client-side navigation through the site's own nav link, so the counters
+  // survive: unmounting the homepage must close the AudioContext it opened.
+  await page.getByRole('link', { name: 'Missions', exact: true }).first().click()
+  await page.waitForURL(/\/missions/, { timeout: 15000 })
+  await page.waitForTimeout(900)
+  const afterLeave = await probe()
+  log(
+    'leaving the homepage closes its player',
+    afterLeave.contexts.created > 0 && afterLeave.contexts.closed >= 1 && afterLeave.contexts.running === 0,
+    JSON.stringify(afterLeave.contexts),
+  )
+  log(
+    'no music control outside the homepage',
+    (await page.getByRole('button', { name: 'Mute background music', exact: true }).count()) === 0,
+    'control absent',
   )
 
   // ------------------------------------------------------------ open film
@@ -108,7 +190,16 @@ try {
   const afterPlay = await probe()
   const progressWhilePlaying = await progress()
   log('film renders one canvas', afterPlay.canvases === 1, `canvases=${afterPlay.canvases}`)
-  log('narration reaches the speech engine', afterPlay.speaking === true, `utterances=${afterPlay.utterances}`)
+  log(
+    'narration really starts (engine start event)',
+    afterPlay.starts > 0,
+    `starts=${afterPlay.starts} utterances=${afterPlay.utterances} speaking=${afterPlay.speaking}`,
+  )
+  log(
+    'the film does not reuse the home player',
+    afterPlay.contexts.running === 0,
+    JSON.stringify(afterPlay.contexts),
+  )
   log('narration text is not empty', (afterPlay.lastText ?? '').length > 20, JSON.stringify(afterPlay.lastText))
 
   const playingFps = await framesPerSecond(1500)
@@ -255,7 +346,27 @@ async function launch() {
 
 /** Installed before any page script, so it also counts the very first frame. */
 function instrument() {
-  window.__smoke = { raf: 0, utterances: [], lastText: null }
+  window.__smoke = { raf: 0, utterances: [], lastText: null, starts: 0, contexts: { created: 0, closed: 0, running: 0 } }
+  window.__openContexts = []
+  // Count the Home page's audio graph: it must be created once and closed on
+  // navigation, never left running under another route.
+  const NativeContext = window.AudioContext
+  if (NativeContext) {
+    const Tracked = function (...args) {
+      const context = new NativeContext(...args)
+      window.__smoke.contexts.created += 1
+      window.__openContexts.push(context)
+      const close = context.close.bind(context)
+      context.close = (...closeArgs) => {
+        window.__smoke.contexts.closed += 1
+        window.__openContexts = window.__openContexts.filter((entry) => entry !== context)
+        return close(...closeArgs)
+      }
+      return context
+    }
+    Tracked.prototype = NativeContext.prototype
+    window.AudioContext = Tracked
+  }
   const nativeRaf = window.requestAnimationFrame.bind(window)
   window.requestAnimationFrame = (callback) => {
     window.__smoke.raf += 1
@@ -268,6 +379,10 @@ function instrument() {
       try {
         window.__smoke.utterances.push(String(utterance?.text ?? ''))
         window.__smoke.lastText = String(utterance?.text ?? '')
+        // `start` is the only event that proves the line reached the output.
+        utterance?.addEventListener?.('start', () => {
+          window.__smoke.starts += 1
+        })
       } catch {
         /* ignore */
       }
@@ -277,11 +392,16 @@ function instrument() {
 }
 
 function instrumentedProbe() {
-  const state = window.__smoke ?? { raf: 0, utterances: [] }
+  const state = window.__smoke ?? { raf: 0, utterances: [], starts: 0, contexts: { created: 0, closed: 0, running: 0 } }
   return {
     raf: state.raf,
     utterances: state.utterances.length,
     lastText: state.lastText,
+    starts: state.starts,
+    contexts: {
+      ...state.contexts,
+      running: (window.__openContexts ?? []).filter((ctx) => ctx.state === 'running').length,
+    },
     canvases: document.querySelectorAll('canvas').length,
     speaking: window.speechSynthesis ? window.speechSynthesis.speaking : null,
   }

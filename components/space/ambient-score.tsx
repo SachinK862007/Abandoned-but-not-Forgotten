@@ -2,34 +2,44 @@
 
 import { ChevronUp, Music2, Volume2, VolumeX } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { DEFAULT_ENABLED, DEFAULT_VOLUME, clampVolume, targetGain } from '@/lib/ambient-score-core.mjs'
+import {
+  AUTOPLAY_FADE_SECONDS,
+  DEFAULT_VOLUME,
+  MUTE_FADE_SECONDS,
+  UNMUTE_FADE_SECONDS,
+  VOLUME_RAMP_SECONDS,
+  clampVolume,
+  isPlaybackRunning,
+  isSilentVolume,
+  targetGain,
+} from '@/lib/ambient-score-core.mjs'
 
 /**
- * Home-page ambient score with volume control.
+ * Home-page background music.
  *
- * The music itself is unchanged: four slowly breathing pad voices and a sparse
- * bell figure, all generated with the Web Audio API. No audio file is
- * downloaded and nothing copyrighted is reproduced.
+ * Four slowly breathing pad voices and a sparse bell figure, all generated with
+ * the Web Audio API — no audio file is downloaded and nothing copyrighted is
+ * reproduced.
  *
  * Behaviour:
- *   • 100% is the full application level (no hidden 40% multiplier). A limiter
- *     sits before the destination so a full mix cannot clip.
- *   • Hovering or keyboard-focusing the button reveals a compact volume slider.
- *   • Clicking the button fades the master gain to zero over ~1.3 s and only
- *     then suspends the AudioContext; the oscillators are never cut mid-note.
- *   • Unmuting resumes the same graph and fades back to the stored volume.
- *   • The chosen volume is remembered in localStorage.
- *   • The score is silent until the visitor deliberately starts it (music
- *     button). The component only exists on "/" — leaving the homepage tears it
- *     down, and coming back starts from a clean, silent state.
+ *   • A fresh load is unmuted at 40% and *tries* to play: the graph is built,
+ *     the context is resumed and the master gain fades in over ~1.2 s.
+ *   • Browsers (Edge included) may refuse autoplay. The refusal is detected by
+ *     the context state, never worked around: the control becomes "Enable
+ *     sound" and one real click starts the music. There is no retry loop.
+ *   • Muting fades to zero over 0.8 s and only then suspends the context, so
+ *     the score is never cut mid-note and the UI never claims to be playing
+ *     when it is not.
+ *   • Nothing is persisted: a reload is always unmuted at 40%.
+ *   • The component is mounted only on "/" (see app-shell.tsx) and closes its
+ *     context on unmount, so the music cannot follow the visitor to Mission
+ *     Film or any other route, and a second player is never created.
  */
 
-const STORAGE_KEY = 'space-relics:volume'
-const FADE_IN_SECONDS = 1
-/** Slow, unhurried fade used when the visitor mutes the score. */
-const MUTE_FADE_SECONDS = 1.8
+type Status = 'starting' | 'playing' | 'muted' | 'blocked'
 
-
+/** How long a resume() may pend before autoplay counts as blocked. */
+const AUTOPLAY_PROBE_MS = 700
 
 export default function AmbientScore() {
   const ctxRef = useRef<AudioContext | null>(null)
@@ -38,15 +48,23 @@ export default function AmbientScore() {
   const noteTimerRef = useRef<number | null>(null)
   const playNoteRef = useRef<(() => void) | null>(null)
   const suspendTimerRef = useRef<number | null>(null)
-  const enabledRef = useRef(DEFAULT_ENABLED)
+  const statusRef = useRef<Status>('starting')
+  const wantedRef = useRef(true)
   const volumeRef = useRef(DEFAULT_VOLUME)
+  const resumeOnReturnRef = useRef(false)
+  const mountedRef = useRef(true)
 
-  const [enabled, setEnabled] = useState(DEFAULT_ENABLED)
+  const [status, setStatus] = useState<Status>('starting')
   const [volume, setVolume] = useState(DEFAULT_VOLUME)
   const [hovered, setHovered] = useState(false)
   const [pinned, setPinned] = useState(false)
 
   const open = hovered || pinned
+
+  const phase = useCallback((next: Status) => {
+    statusRef.current = next
+    if (mountedRef.current) setStatus(next)
+  }, [])
 
   const clearSuspendTimer = useCallback(() => {
     if (suspendTimerRef.current !== null) {
@@ -56,10 +74,12 @@ export default function AmbientScore() {
   }, [])
 
   /**
-   * Ramps the master gain from its current value to `target` over `seconds`.
-   * Cancels any earlier automation first, so rapid clicks never stack ramps.
+   * Ramps the master gain from its current value to `target`. Cancels any
+   * earlier automation first, so rapid clicks can never stack ramps — the
+   * exact reason repeated mute/unmute used to leave the score at the wrong
+   * level.
    */
-  const ramp = useCallback((target: number, seconds: number) => {
+  const fade = useCallback((target: number, seconds: number) => {
     const ctx = ctxRef.current
     const master = masterRef.current
     if (!ctx || !master) return
@@ -79,12 +99,23 @@ export default function AmbientScore() {
     gain.linearRampToValueAtTime(target, now + seconds)
   }, [])
 
-  const stop = useCallback(() => {
-    clearSuspendTimer()
+  const stopNotes = useCallback(() => {
     if (noteTimerRef.current !== null) {
       window.clearInterval(noteTimerRef.current)
       noteTimerRef.current = null
     }
+  }, [])
+
+  const startNotes = useCallback(() => {
+    if (noteTimerRef.current === null && playNoteRef.current) {
+      noteTimerRef.current = window.setInterval(() => playNoteRef.current?.(), 2900)
+    }
+  }, [])
+
+  /** Full teardown: timers, oscillators and the AudioContext itself. */
+  const teardown = useCallback(() => {
+    clearSuspendTimer()
+    stopNotes()
     for (const source of sourcesRef.current) {
       try {
         source.stop()
@@ -94,27 +125,30 @@ export default function AmbientScore() {
       }
     }
     sourcesRef.current = []
+    playNoteRef.current = null
     const ctx = ctxRef.current
     ctxRef.current = null
     masterRef.current = null
     if (ctx && ctx.state !== 'closed') void ctx.close().catch(() => undefined)
-  }, [clearSuspendTimer])
+  }, [clearSuspendTimer, stopNotes])
 
-  const start = useCallback(() => {
+  /**
+   * Builds the audio graph once. Returns the existing context when the graph is
+   * already up, so no code path can create a second player.
+   */
+  const build = useCallback(() => {
     const existing = ctxRef.current
-    if (existing) {
-      void existing.resume().catch(() => undefined)
-      return
-    }
+    if (existing) return existing
 
     const Ctor =
       window.AudioContext ??
       (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
-    if (!Ctor) return
+    if (!Ctor) return null
 
     const ctx = new Ctor()
 
-    // Safety limiter: protects audio quality at 100% instead of capping volume.
+    // Safety limiter: protects audio quality near full volume instead of
+    // capping the level the visitor chose.
     const limiter = ctx.createDynamicsCompressor()
     limiter.threshold.value = -4
     limiter.knee.value = 6
@@ -196,104 +230,161 @@ export default function AmbientScore() {
       osc.stop(now + 5.6)
     }
     playNoteRef.current = playNote
-    noteTimerRef.current = window.setInterval(playNote, 2900)
 
-    const target = targetGain(volumeRef.current, enabledRef.current)
-    master.gain.linearRampToValueAtTime(target, ctx.currentTime + 2.2)
-    void ctx.resume().catch(() => undefined)
+    return ctx
   }, [])
 
-  const toggle = useCallback(() => {
-    const ctx = ctxRef.current
-    if (!ctx) {
-      enabledRef.current = true
-      setEnabled(true)
-      start()
-      return
-    }
-
-    clearSuspendTimer()
-
-    if (enabledRef.current) {
-      // Mute: fade the tail out quickly, stop scheduling notes, and then make
-      // absolutely sure the graph is silent — gain pinned to zero *and* the
-      // context suspended — rather than relying on the fade alone.
-      enabledRef.current = false
-      setEnabled(false)
-      ramp(0, MUTE_FADE_SECONDS)
-      if (noteTimerRef.current !== null) {
-        window.clearInterval(noteTimerRef.current)
-        noteTimerRef.current = null
+  /**
+   * Starts (or resumes) playback and fades in.
+   *
+   * Resolves true only when the context is actually running — the audible
+   * state, not the promise. A browser that refuses autoplay leaves the context
+   * suspended, and that is reported as `blocked`.
+   */
+  const begin = useCallback(
+    async (seconds: number) => {
+      if (isSilentVolume(volumeRef.current)) {
+        phase('muted')
+        return false
       }
-      suspendTimerRef.current = window.setTimeout(() => {
-        suspendTimerRef.current = null
-        if (enabledRef.current) return
-        const active = ctxRef.current
-        const master = masterRef.current
-        if (active && master) {
-          const now = active.currentTime
-          master.gain.cancelScheduledValues(now)
-          master.gain.setValueAtTime(0, now)
+
+      const ctx = build()
+      const master = masterRef.current
+      if (!ctx || !master) {
+        phase('blocked')
+        return false
+      }
+
+      // resume() can pend until a gesture when autoplay is blocked, so it is
+      // bounded: an unresolved resume is treated as blocked, not awaited.
+      const running = await Promise.race([
+        ctx
+          .resume()
+          .then(() => true)
+          .catch(() => false),
+        new Promise<boolean>((resolve) => {
+          window.setTimeout(() => resolve(false), AUTOPLAY_PROBE_MS)
+        }),
+      ])
+
+      if (!mountedRef.current) return false
+      if (!running || !isPlaybackRunning(ctx.state)) {
+        phase('blocked')
+        return false
+      }
+
+      // Always start from silence: unmuting never jumps to full level.
+      const now = ctx.currentTime
+      master.gain.cancelScheduledValues(now)
+      master.gain.setValueAtTime(0, now)
+      wantedRef.current = true
+      startNotes()
+      phase('playing')
+      fade(targetGain(volumeRef.current, true), seconds)
+      return true
+    },
+    [build, fade, phase, startNotes],
+  )
+
+  const mute = useCallback(() => {
+    wantedRef.current = false
+    clearSuspendTimer()
+    stopNotes()
+    phase('muted')
+    const ctx = ctxRef.current
+    const master = masterRef.current
+    if (!ctx || !master) return
+
+    fade(0, MUTE_FADE_SECONDS)
+    // Pause only after the fade has finished, so the tail is heard and the
+    // interface changes state in the same order a listener experiences it.
+    suspendTimerRef.current = window.setTimeout(() => {
+      suspendTimerRef.current = null
+      if (wantedRef.current) return
+      const active = ctxRef.current
+      const current = masterRef.current
+      if (!active || !current) return
+      const now = active.currentTime
+      current.gain.cancelScheduledValues(now)
+      current.gain.setValueAtTime(0, now)
+      if (active.state === 'running') void active.suspend().catch(() => undefined)
+    }, Math.round(MUTE_FADE_SECONDS * 1000) + 120)
+  }, [clearSuspendTimer, fade, phase, stopNotes])
+
+  // One autoplay attempt on mount (never a retry loop). The cleanup closes the
+  // whole graph, which is what keeps the music on the homepage only.
+  useEffect(() => {
+    mountedRef.current = true
+    void begin(AUTOPLAY_FADE_SECONDS)
+    return () => {
+      mountedRef.current = false
+      teardown()
+    }
+  }, [begin, teardown])
+
+  // A hidden tab must not keep playing. Music that was playing is remembered
+  // and restored on return; music the visitor muted stays muted.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        if (statusRef.current === 'playing') {
+          resumeOnReturnRef.current = true
+          mute()
         }
-        if (active && active.state === 'running') void active.suspend().catch(() => undefined)
-      }, Math.round(MUTE_FADE_SECONDS * 1000) + 120)
+        return
+      }
+      if (!resumeOnReturnRef.current) return
+      resumeOnReturnRef.current = false
+      void begin(UNMUTE_FADE_SECONDS)
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [begin, mute])
+
+  /** Called by a real click/tap only. */
+  const enable = useCallback(() => {
+    void begin(UNMUTE_FADE_SECONDS)
+  }, [begin])
+
+  const toggle = useCallback(() => {
+    if (statusRef.current === 'playing') {
+      mute()
       return
     }
-
-    enabledRef.current = true
-    setEnabled(true)
-    if (noteTimerRef.current === null && playNoteRef.current) {
-      noteTimerRef.current = window.setInterval(() => playNoteRef.current?.(), 2900)
-    }
-    const target = targetGain(volumeRef.current, true)
-    void ctx
-      .resume()
-      .then(() => ramp(target, FADE_IN_SECONDS))
-      .catch(() => ramp(target, 0))
-  }, [clearSuspendTimer, ramp, start])
+    enable()
+  }, [enable, mute])
 
   const changeVolume = useCallback(
     (next: number) => {
       const value = clampVolume(next)
       volumeRef.current = value
       setVolume(value)
-      try {
-        window.localStorage.setItem(STORAGE_KEY, String(value))
-      } catch {
-        // Storage can be blocked (private mode); the session still works.
+
+      if (isSilentVolume(value)) {
+        // Zero *is* the muted state: silence, and an honest icon.
+        if (statusRef.current === 'playing') mute()
+        else phase('muted')
+        return
       }
-      // Changing volume while muted only records the preference.
-      if (enabledRef.current) ramp(targetGain(value, true), 0.08)
+
+      if (statusRef.current === 'playing') {
+        fade(targetGain(value, true), VOLUME_RAMP_SECONDS)
+        return
+      }
+
+      // Dragging the slider is a gesture, so raising the volume from muted (or
+      // from a blocked autoplay) restores sound.
+      enable()
     },
-    [ramp],
+    [enable, fade, mute, phase],
   )
 
-  // Restore the saved preference after hydration (server and client both render
-  // 100% first, so there is no mismatch).
-  useEffect(() => {
-    try {
-      const raw = window.localStorage.getItem(STORAGE_KEY)
-      if (raw === null) return
-      const parsed = Number(raw)
-      if (!Number.isFinite(parsed)) return
-      const value = clampVolume(parsed)
-      volumeRef.current = value
-      setVolume(value)
-    } catch {
-      // ignore
-    }
-  }, [])
-
-  // Audio is started only by an explicit user gesture (the music button, or the
-  // volume control). No passive unlock listeners, no timers, no autoplay: this
-  // respects browser autoplay rules and never surprises a visitor with sound.
-  // The component only lives on "/", so leaving the homepage tears everything
-  // down and coming back starts from a clean, silent state.
-
-  useEffect(() => stop, [stop])
+  const playing = status === 'playing'
+  const blocked = status === 'blocked'
 
   return (
     <div
+      data-music-status={status}
       className="fixed bottom-5 right-5 z-40 flex flex-col items-end"
       onPointerEnter={() => setHovered(true)}
       onPointerLeave={() => setHovered(false)}
@@ -302,12 +393,25 @@ export default function AmbientScore() {
         if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setHovered(false)
       }}
     >
-      {/* Volume panel: stays attached to the button, revealed on hover/focus or
-          pinned on touch. The bottom padding bridges the gap so moving the
-          pointer from the icon to the slider never dismisses it. */}
+      {/* Autoplay was refused: one click is all it takes, and the control says
+          so instead of pretending the music is playing. */}
+      {blocked && (
+        <button
+          type="button"
+          onClick={enable}
+          aria-label="Enable background music"
+          className="mb-2 flex items-center gap-1.5 rounded-full border border-electric/50 bg-electric/15 px-3 py-1.5 font-display text-[10px] uppercase tracking-[0.16em] text-starlight shadow-[0_0_24px_rgba(131,183,255,0.25)] backdrop-blur transition-colors hover:border-electric/80 hover:bg-electric/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric/70"
+        >
+          <Volume2 className="size-3.5" aria-hidden />
+          Enable sound
+        </button>
+      )}
+
+      {/* Volume panel: revealed on hover/focus, or pinned on touch. The slider
+          is always focusable, so keyboard users reach it with Tab. */}
       <div
         id="ambient-score-volume"
-        className={`absolute bottom-full right-0 pb-2 transition-all duration-200 ease-out motion-reduce:transition-none ${
+        className={`absolute bottom-full right-0 mb-12 pb-2 transition-all duration-200 ease-out motion-reduce:transition-none ${
           open ? 'pointer-events-auto translate-y-0 opacity-100' : 'pointer-events-none translate-y-1 opacity-0'
         }`}
       >
@@ -320,8 +424,7 @@ export default function AmbientScore() {
             step={1}
             value={volume}
             onChange={(event) => changeVolume(Number(event.target.value))}
-            tabIndex={open ? 0 : -1}
-            aria-label="Ambient score volume"
+            aria-label="Background music volume"
             aria-valuetext={`${volume} percent`}
             className="h-4 w-24 cursor-pointer accent-electric focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric/70"
           />
@@ -331,8 +434,8 @@ export default function AmbientScore() {
         </div>
       </div>
 
-      {/* Touch devices have no hover: a small chevron reveals the slider without
-          touching the mute action. Hidden wherever hovering is possible. */}
+      {/* Touch devices have no hover: a small chevron reveals the slider
+          without touching the mute action. Hidden wherever hovering is possible. */}
       <button
         type="button"
         onClick={() => setPinned((value) => !value)}
@@ -347,12 +450,12 @@ export default function AmbientScore() {
       <button
         type="button"
         onClick={toggle}
-        aria-pressed={enabled}
-        aria-label={enabled ? 'Mute ambient score' : 'Play ambient score'}
-        title={`Ambient score · ${volume}%`}
+        aria-pressed={playing}
+        aria-label={playing ? 'Mute background music' : 'Unmute background music'}
+        title={`Background music · ${volume}%`}
         className="flex size-10 items-center justify-center rounded-full border border-orbit/30 bg-void/70 text-moon backdrop-blur transition-colors hover:border-electric/60 hover:text-starlight focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric/70 focus-visible:ring-offset-2 focus-visible:ring-offset-void"
       >
-        {enabled ? <Music2 className="size-4" aria-hidden /> : <VolumeX className="size-4" aria-hidden />}
+        {playing ? <Music2 className="size-4" aria-hidden /> : <VolumeX className="size-4" aria-hidden />}
       </button>
     </div>
   )
