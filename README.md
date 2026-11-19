@@ -98,10 +98,19 @@ durable, so a file-backed store would silently lose data.
 2. Copy the **pooled** connection string.
 3. Locally: put it in `.env.local` as `DATABASE_URL=...`.
 4. Vercel: Project → Settings → Environment Variables → add `DATABASE_URL` for
-   Production **and** Preview, then redeploy.
-5. Run `npm run db:migrate` once (the app also applies pending migrations on
-   the first request of a cold start, so this is a convenience, not a
-   requirement).
+   **Production** (with `APP_ORIGIN`), then redeploy.
+5. Vercel **Preview** needs its own value: create a separate Neon branch (or
+   database) for previews and set `DATABASE_URL` for the Preview scope to that
+   branch's connection string. Never reuse the production string there — a
+   preview build auto-applies pending migrations on its first request, so a
+   shared database lets preview code change live data.
+6. Run `npm run db:migrate` once against each database (the app also applies
+   pending migrations on the first request of a cold start, so this is a
+   convenience, not a requirement).
+
+Local development is a third case: either put a local PostgreSQL `DATABASE_URL`
+in `.env.local`, or leave it unset and the app uses the embedded PGlite database
+under the git-ignored `.data/pglite`.
 
 Schema (`lib/migrations.mjs`): `missions` (primary key `id`, plus `session_id`,
 launch-site and rocket fields, `parts_json`, `created_at`) with an index on
@@ -198,8 +207,10 @@ not report-only).
    tier is fine).
 2. Copy `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
 3. Vercel: Project → Settings → Environment Variables → add **both** variables
-   to Production **and** Preview. They are server-only (never `NEXT_PUBLIC_`).
-4. Redeploy. `/api/health` should then report `checks.rateLimit.mode: "upstash"`
+   to Production. They are server-only (never `NEXT_PUBLIC_`).
+4. For Preview, add a separate Upstash database (its own URL and token) so
+   preview deployments cannot spend the production rate-limit budget.
+5. Redeploy. `/api/health` should then report `checks.rateLimit.mode: "upstash"`
    and `ok: true`.
 
 Never print, commit or paste either token anywhere other than Vercel's secret
